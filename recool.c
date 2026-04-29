@@ -23,7 +23,7 @@
 #define KEYFRAME_INTERVAL           300         // I-frame every 5 minutes
 
 // Hardware acceleration
-#define VAAPI_DEVICE                "/dev/dri/renderD128"
+#define VAAPI_DEVICE                NULL        // Auto-detect (use "/dev/dri/renderD128" to force specific device)
 #define REQUIRE_HARDWARE_ACCEL      0           // Exit if no GPU encoder found
 
 // Portal configuration
@@ -152,7 +152,7 @@ static void setup_signal_handlers(void) {
     sa.sa_handler = signal_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    
+
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
 }
@@ -167,14 +167,14 @@ static char* expand_home_path(const char *path) {
         fprintf(stderr, "[ERROR] HOME environment variable not set\n");
         return NULL;
     }
-    
+
     size_t len = strlen(home) + strlen(path) + 2;
     char *expanded = malloc(len);
     if (!expanded) {
         fprintf(stderr, "[ERROR] Memory allocation failed\n");
         return NULL;
     }
-    
+
     snprintf(expanded, len, "%s/%s", home, path);
     return expanded;
 }
@@ -182,24 +182,24 @@ static char* expand_home_path(const char *path) {
 static bool create_directory_recursive(const char *path) {
     char *path_copy = strdup(path);
     if (!path_copy) return false;
-    
+
     char *p = path_copy;
     if (*p == '/') p++;
-    
+
     while (*p) {
         while (*p && *p != '/') p++;
         char tmp = *p;
         *p = '\0';
-        
+
         if (mkdir(path_copy, 0755) != 0 && errno != EEXIST) {
             free(path_copy);
             return false;
         }
-        
+
         *p = tmp;
         if (*p) p++;
     }
-    
+
     free(path_copy);
     return true;
 }
@@ -207,29 +207,29 @@ static bool create_directory_recursive(const char *path) {
 static char* get_output_filename(void) {
     char *base_dir = expand_home_path(OUTPUT_BASE_DIR);
     if (!base_dir) return NULL;
-    
+
     if (!create_directory_recursive(base_dir)) {
         fprintf(stderr, "[ERROR] Cannot create output directory: %s\n", base_dir);
         free(base_dir);
         return NULL;
     }
-    
+
     time_t now = time(NULL);
     struct tm *tm_info = localtime(&now);
-    
+
     char timestamp[64];
     strftime(timestamp, sizeof(timestamp), OUTPUT_FILENAME_FORMAT, tm_info);
-    
+
     size_t len = strlen(base_dir) + strlen(timestamp) + strlen(OUTPUT_FILE_EXTENSION) + 2;
     char *output_path = malloc(len);
     if (!output_path) {
         free(base_dir);
         return NULL;
     }
-    
+
     snprintf(output_path, len, "%s/%s%s", base_dir, timestamp, OUTPUT_FILE_EXTENSION);
     free(base_dir);
-    
+
     return output_path;
 }
 
@@ -240,38 +240,38 @@ static char* get_output_filename(void) {
 static char* restore_token_load(void) {
     char *token_path = expand_home_path(RESTORE_TOKEN_FILE);
     if (!token_path) return NULL;
-    
+
     FILE *f = fopen(token_path, "r");
     if (!f) {
         free(token_path);
         return NULL;
     }
-    
+
     char buffer[256] = {0};
     if (!fgets(buffer, sizeof(buffer), f)) {
         fclose(f);
         free(token_path);
         return NULL;
     }
-    
+
     fclose(f);
     free(token_path);
-    
+
     // Remove newline
     size_t len = strlen(buffer);
     if (len > 0 && buffer[len-1] == '\n') {
         buffer[len-1] = '\0';
     }
-    
+
     return strdup(buffer);
 }
 
 static bool restore_token_save(const char *token) {
     if (!token) return false;
-    
+
     char *token_path = expand_home_path(RESTORE_TOKEN_FILE);
     if (!token_path) return false;
-    
+
     // Create parent directory
     char *dir_path = strdup(token_path);
     char *last_slash = strrchr(dir_path, '/');
@@ -280,18 +280,18 @@ static bool restore_token_save(const char *token) {
         create_directory_recursive(dir_path);
     }
     free(dir_path);
-    
+
     FILE *f = fopen(token_path, "w");
     if (!f) {
         fprintf(stderr, "[WARNING] Cannot save restore token: %s\n", strerror(errno));
         free(token_path);
         return false;
     }
-    
+
     fprintf(f, "%s\n", token);
     fclose(f);
     free(token_path);
-    
+
     return true;
 }
 
@@ -316,39 +316,39 @@ static char* generate_session_token(void) {
 static DBusHandlerResult signal_filter(DBusConnection *connection, DBusMessage *message, void *user_data) {
     (void)connection;
     PortalContext *ctx = user_data;
-    
+
     if (dbus_message_is_signal(message, "org.freedesktop.portal.Request", "Response")) {
         DBusMessageIter args, dict_iter, entry_iter, variant_iter;
-        
+
         // Get response code
         if (!dbus_message_iter_init(message, &args)) {
             return DBUS_HANDLER_RESULT_HANDLED;
         }
-        
+
         uint32_t response;
         dbus_message_iter_get_basic(&args, &response);
         ctx->response_code = response;
-        
+
         // Get results dictionary
         if (!dbus_message_iter_next(&args)) {
             return DBUS_HANDLER_RESULT_HANDLED;
         }
-        
+
         if (dbus_message_iter_get_arg_type(&args) != DBUS_TYPE_ARRAY) {
             return DBUS_HANDLER_RESULT_HANDLED;
         }
-        
+
         dbus_message_iter_recurse(&args, &dict_iter);
-        
-        // Extract session_handle and streams
+
+        // Extract session_handle, streams, and restore_token
         while (dbus_message_iter_get_arg_type(&dict_iter) == DBUS_TYPE_DICT_ENTRY) {
             dbus_message_iter_recurse(&dict_iter, &entry_iter);
-            
+
             const char *key;
             dbus_message_iter_get_basic(&entry_iter, &key);
             dbus_message_iter_next(&entry_iter);
             dbus_message_iter_recurse(&entry_iter, &variant_iter);
-            
+
             if (strcmp(key, "session_handle") == 0) {
                 const char *session_handle;
                 dbus_message_iter_get_basic(&variant_iter, &session_handle);
@@ -359,7 +359,7 @@ static DBusHandlerResult signal_filter(DBusConnection *connection, DBusMessage *
                 if (dbus_message_iter_get_arg_type(&variant_iter) == DBUS_TYPE_ARRAY) {
                     DBusMessageIter streams_iter, stream_struct;
                     dbus_message_iter_recurse(&variant_iter, &streams_iter);
-                    
+
                     if (dbus_message_iter_get_arg_type(&streams_iter) == DBUS_TYPE_STRUCT) {
                         dbus_message_iter_recurse(&streams_iter, &stream_struct);
                         uint32_t node_id;
@@ -367,69 +367,72 @@ static DBusHandlerResult signal_filter(DBusConnection *connection, DBusMessage *
                         ctx->pipewire_node = node_id;
                     }
                 }
+            } else if (strcmp(key, "restore_token") == 0) {
+                const char *restore_token;
+                dbus_message_iter_get_basic(&variant_iter, &restore_token);
+                if (ctx->restore_token) free(ctx->restore_token);
+                ctx->restore_token = strdup(restore_token);
             }
-            
+
             dbus_message_iter_next(&dict_iter);
         }
-        
+
         ctx->response_received = true;
         return DBUS_HANDLER_RESULT_HANDLED;
     }
-    
+
     return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
 }
 
 static int wait_for_response(PortalContext *ctx, int timeout_ms) {
     ctx->response_received = false;
     ctx->response_code = 1;
-    
+
     int elapsed = 0;
     while (!ctx->response_received && elapsed < timeout_ms) {
         dbus_connection_read_write_dispatch(ctx->connection, 100);
         elapsed += 100;
     }
-    
+
     if (!ctx->response_received) {
         fprintf(stderr, "[ERROR] Timeout waiting for portal response\n");
         return -1;
     }
-    
+
     if (ctx->response_code != 0) {
         fprintf(stderr, "[ERROR] Portal request denied (code: %u)\n", ctx->response_code);
         return -1;
     }
-    
+
     return 0;
 }
 
-static int portal_create_session(PortalContext *ctx, const char *restore_token) {
-    (void)restore_token;  // TODO: implement restore token
-    
+static int portal_create_session(PortalContext *ctx) {
     char *session_token = generate_session_token();
     char *request_token = generate_request_token();
-    
+
     // Build expected request path
     const char *sender = dbus_bus_get_unique_name(ctx->connection);
     char *sender_clean = strdup(sender + 1);
     for (char *p = sender_clean; *p; p++) {
         if (*p == '.') *p = '_';
     }
-    
+
     char request_path[512];
     snprintf(request_path, sizeof(request_path),
              "/org/freedesktop/portal/desktop/request/%s/%s",
              sender_clean, request_token);
-    
+
     // Subscribe to Response signal for this request
     char match_rule[1024];
     snprintf(match_rule, sizeof(match_rule),
              "type='signal',sender='org.freedesktop.portal.Desktop',"
              "interface='org.freedesktop.portal.Request',member='Response',"
              "path='%s'", request_path);
-    
+
     dbus_bus_add_match(ctx->connection, match_rule, NULL);
     dbus_connection_flush(ctx->connection);
-    
+
     // Call CreateSession
     DBusMessage *msg = dbus_message_new_method_call(
         "org.freedesktop.portal.Desktop",
@@ -437,11 +440,11 @@ static int portal_create_session(PortalContext *ctx, const char *restore_token) 
         "org.freedesktop.portal.ScreenCast",
         "CreateSession"
     );
-    
+
     DBusMessageIter args, dict;
     dbus_message_iter_init_append(msg, &args);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
-    
+
     // Add session_handle_token
     {
         DBusMessageIter entry, variant;
@@ -453,7 +456,7 @@ static int portal_create_session(PortalContext *ctx, const char *restore_token) 
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&dict, &entry);
     }
-    
+
     // Add handle_token
     {
         DBusMessageIter entry, variant;
@@ -465,17 +468,17 @@ static int portal_create_session(PortalContext *ctx, const char *restore_token) 
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&dict, &entry);
     }
-    
+
     dbus_message_iter_close_container(&args, &dict);
-    
+
     DBusError error;
     dbus_error_init(&error);
     DBusMessage *reply = dbus_connection_send_with_reply_and_block(
         ctx->connection, msg, DBUS_TIMEOUT_MS, &error
     );
-    
+
     dbus_message_unref(msg);
-    
+
     if (dbus_error_is_set(&error)) {
         fprintf(stderr, "[ERROR] CreateSession failed: %s\n", error.message);
         dbus_error_free(&error);
@@ -484,61 +487,61 @@ static int portal_create_session(PortalContext *ctx, const char *restore_token) 
         free(sender_clean);
         return -1;
     }
-    
+
     dbus_message_unref(reply);
-    
+
     // Build expected session handle
     char session_handle[512];
     snprintf(session_handle, sizeof(session_handle),
              "/org/freedesktop/portal/desktop/session/%s/%s",
              sender_clean, session_token);
     ctx->session_handle = strdup(session_handle);
-    
+
     free(session_token);
     free(request_token);
     free(sender_clean);
-    
+
     // Wait for Response signal
     return wait_for_response(ctx, DBUS_TIMEOUT_MS);
 }
 
-static int portal_select_sources(PortalContext *ctx) {
+static int portal_select_sources(PortalContext *ctx, const char *restore_token) {
     char *request_token = generate_request_token();
-    
+
     // Build expected request path
     const char *sender = dbus_bus_get_unique_name(ctx->connection);
     char *sender_clean = strdup(sender + 1);
     for (char *p = sender_clean; *p; p++) {
         if (*p == '.') *p = '_';
     }
-    
+
     char request_path[512];
     snprintf(request_path, sizeof(request_path),
              "/org/freedesktop/portal/desktop/request/%s/%s",
              sender_clean, request_token);
-    
+
     // Subscribe to Response signal
     char match_rule[1024];
     snprintf(match_rule, sizeof(match_rule),
              "type='signal',sender='org.freedesktop.portal.Desktop',"
              "interface='org.freedesktop.portal.Request',member='Response',"
              "path='%s'", request_path);
-    
+
     dbus_bus_add_match(ctx->connection, match_rule, NULL);
     dbus_connection_flush(ctx->connection);
-    
+
     DBusMessage *msg = dbus_message_new_method_call(
         "org.freedesktop.portal.Desktop",
         "/org/freedesktop/portal/desktop",
         "org.freedesktop.portal.ScreenCast",
         "SelectSources"
     );
-    
+
     DBusMessageIter args, dict;
     dbus_message_iter_init_append(msg, &args);
     dbus_message_iter_append_basic(&args, DBUS_TYPE_OBJECT_PATH, &ctx->session_handle);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
-    
+
     // Add types (monitor=1)
     {
         DBusMessageIter entry, variant;
@@ -551,7 +554,7 @@ static int portal_select_sources(PortalContext *ctx) {
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&dict, &entry);
     }
-    
+
     // Add multiple (true for all monitors)
     {
         DBusMessageIter entry, variant;
@@ -564,7 +567,32 @@ static int portal_select_sources(PortalContext *ctx) {
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&dict, &entry);
     }
-    
+
+    // Add restore_token if available
+    if (restore_token && strlen(restore_token) > 0) {
+        DBusMessageIter entry, variant;
+        const char *key = "restore_token";
+        dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "s", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_STRING, &restore_token);
+        dbus_message_iter_close_container(&entry, &variant);
+        dbus_message_iter_close_container(&dict, &entry);
+    }
+
+    // Add persist_mode (2 = persist until explicitly revoked)
+    {
+        DBusMessageIter entry, variant;
+        const char *key = "persist_mode";
+        uint32_t persist_mode = 2;
+        dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+        dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &key);
+        dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "u", &variant);
+        dbus_message_iter_append_basic(&variant, DBUS_TYPE_UINT32, &persist_mode);
+        dbus_message_iter_close_container(&entry, &variant);
+        dbus_message_iter_close_container(&dict, &entry);
+    }
+
     // Add handle_token
     {
         DBusMessageIter entry, variant;
@@ -576,17 +604,17 @@ static int portal_select_sources(PortalContext *ctx) {
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&dict, &entry);
     }
-    
+
     dbus_message_iter_close_container(&args, &dict);
-    
+
     DBusError error;
     dbus_error_init(&error);
     DBusMessage *reply = dbus_connection_send_with_reply_and_block(
         ctx->connection, msg, DBUS_TIMEOUT_MS, &error
     );
-    
+
     dbus_message_unref(msg);
-    
+
     if (dbus_error_is_set(&error)) {
         fprintf(stderr, "[ERROR] SelectSources failed: %s\n", error.message);
         dbus_error_free(&error);
@@ -594,53 +622,53 @@ static int portal_select_sources(PortalContext *ctx) {
         free(sender_clean);
         return -1;
     }
-    
+
     dbus_message_unref(reply);
     free(request_token);
     free(sender_clean);
-    
+
     return wait_for_response(ctx, DBUS_TIMEOUT_MS);
 }
 
 static int portal_start(PortalContext *ctx) {
     char *request_token = generate_request_token();
-    
+
     // Build expected request path
     const char *sender = dbus_bus_get_unique_name(ctx->connection);
     char *sender_clean = strdup(sender + 1);
     for (char *p = sender_clean; *p; p++) {
         if (*p == '.') *p = '_';
     }
-    
+
     char request_path[512];
     snprintf(request_path, sizeof(request_path),
              "/org/freedesktop/portal/desktop/request/%s/%s",
              sender_clean, request_token);
-    
+
     // Subscribe to Response signal
     char match_rule[1024];
     snprintf(match_rule, sizeof(match_rule),
              "type='signal',sender='org.freedesktop.portal.Desktop',"
              "interface='org.freedesktop.portal.Request',member='Response',"
              "path='%s'", request_path);
-    
+
     dbus_bus_add_match(ctx->connection, match_rule, NULL);
     dbus_connection_flush(ctx->connection);
-    
+
     DBusMessage *msg = dbus_message_new_method_call(
         "org.freedesktop.portal.Desktop",
         "/org/freedesktop/portal/desktop",
         "org.freedesktop.portal.ScreenCast",
         "Start"
     );
-    
+
     DBusMessageIter args, dict;
     const char *parent = "";
     dbus_message_iter_init_append(msg, &args);
     dbus_message_iter_append_basic(&args, DBUS_TYPE_OBJECT_PATH, &ctx->session_handle);
     dbus_message_iter_append_basic(&args, DBUS_TYPE_STRING, &parent);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
-    
+
     // Add handle_token
     {
         DBusMessageIter entry, variant;
@@ -652,17 +680,17 @@ static int portal_start(PortalContext *ctx) {
         dbus_message_iter_close_container(&entry, &variant);
         dbus_message_iter_close_container(&dict, &entry);
     }
-    
+
     dbus_message_iter_close_container(&args, &dict);
-    
+
     DBusError error;
     dbus_error_init(&error);
     DBusMessage *reply = dbus_connection_send_with_reply_and_block(
         ctx->connection, msg, DBUS_TIMEOUT_MS, &error
     );
-    
+
     dbus_message_unref(msg);
-    
+
     if (dbus_error_is_set(&error)) {
         fprintf(stderr, "[ERROR] Start failed: %s\n", error.message);
         dbus_error_free(&error);
@@ -670,13 +698,13 @@ static int portal_start(PortalContext *ctx) {
         free(sender_clean);
         return -1;
     }
-    
+
     dbus_message_unref(reply);
     free(request_token);
     free(sender_clean);
-    
+
     fprintf(stderr, "[INFO] Waiting for screen capture permission dialog...\n");
-    
+
     return wait_for_response(ctx, DBUS_TIMEOUT_MS);
 }
 
@@ -687,43 +715,43 @@ static int portal_open_pipewire_remote(PortalContext *ctx) {
         "org.freedesktop.portal.ScreenCast",
         "OpenPipeWireRemote"
     );
-    
+
     DBusMessageIter args, dict;
     dbus_message_iter_init_append(msg, &args);
     dbus_message_iter_append_basic(&args, DBUS_TYPE_OBJECT_PATH, &ctx->session_handle);
     dbus_message_iter_open_container(&args, DBUS_TYPE_ARRAY, "{sv}", &dict);
     dbus_message_iter_close_container(&args, &dict);
-    
+
     DBusError error;
     dbus_error_init(&error);
     DBusMessage *reply = dbus_connection_send_with_reply_and_block(
         ctx->connection, msg, DBUS_TIMEOUT_MS, &error
     );
-    
+
     dbus_message_unref(msg);
-    
+
     if (dbus_error_is_set(&error)) {
         fprintf(stderr, "[ERROR] OpenPipeWireRemote failed: %s\n", error.message);
         dbus_error_free(&error);
         return -1;
     }
-    
+
     // Extract file descriptor
     int fd = -1;
     DBusMessageIter iter;
     dbus_message_iter_init(reply, &iter);
-    
+
     if (dbus_message_iter_get_arg_type(&iter) == DBUS_TYPE_UNIX_FD) {
         dbus_message_iter_get_basic(&iter, &fd);
     }
-    
+
     dbus_message_unref(reply);
-    
+
     if (fd < 0) {
         fprintf(stderr, "[ERROR] Failed to get PipeWire file descriptor\n");
         return -1;
     }
-    
+
     ctx->pipewire_fd = fd;
     return 0;
 }
@@ -731,42 +759,42 @@ static int portal_open_pipewire_remote(PortalContext *ctx) {
 static int portal_request_screencast(PortalContext *ctx, const char *restore_token) {
     DBusError error;
     dbus_error_init(&error);
-    
+
     ctx->connection = dbus_bus_get(DBUS_BUS_SESSION, &error);
     if (dbus_error_is_set(&error)) {
         fprintf(stderr, "[ERROR] Cannot connect to D-Bus session bus: %s\n", error.message);
         dbus_error_free(&error);
         return -1;
     }
-    
+
     // Add signal filter for Response signals
     dbus_connection_add_filter(ctx->connection, signal_filter, ctx, NULL);
-    
+
     if (restore_token) {
         fprintf(stderr, "[INFO] Using saved permission token...\n");
     } else {
         fprintf(stderr, "[INFO] Requesting screen capture permission...\n");
     }
-    
-    if (portal_create_session(ctx, restore_token) < 0) {
+
+    if (portal_create_session(ctx) < 0) {
         return -1;
     }
-    
-    if (portal_select_sources(ctx) < 0) {
+
+    if (portal_select_sources(ctx, restore_token) < 0) {
         return -1;
     }
-    
+
     if (portal_start(ctx) < 0) {
         return -1;
     }
-    
+
     if (portal_open_pipewire_remote(ctx) < 0) {
         return -1;
     }
-    
+
     fprintf(stderr, "[INFO] Screen capture permission granted\n");
     fprintf(stderr, "[INFO] PipeWire node ID: %u\n", ctx->pipewire_node);
-    
+
     return 0;
 }
 
@@ -774,6 +802,10 @@ static void portal_cleanup(PortalContext *ctx) {
     if (ctx->session_handle) {
         free(ctx->session_handle);
         ctx->session_handle = NULL;
+    }
+    if (ctx->restore_token) {
+        free(ctx->restore_token);
+        ctx->restore_token = NULL;
     }
     if (ctx->connection) {
         dbus_connection_unref(ctx->connection);
@@ -787,20 +819,20 @@ static void portal_cleanup(PortalContext *ctx) {
 
 static void on_stream_param_changed(void *data, uint32_t id, const struct spa_pod *param) {
     PipeWireContext *ctx = data;
-    
+
     if (param == NULL || id != SPA_PARAM_Format) {
         return;
     }
-    
+
     struct spa_video_info_raw info;
     if (spa_format_video_raw_parse(param, &info) < 0) {
         return;
     }
-    
+
     ctx->width = info.size.width;
     ctx->height = info.size.height;
     ctx->format = info.format;
-    
+
     fprintf(stderr, "[INFO] Native resolution: %dx%d\n", ctx->width, ctx->height);
 }
 
@@ -808,23 +840,23 @@ static void on_stream_process(void *data) {
     PipeWireContext *ctx = data;
     struct pw_buffer *buf;
     struct spa_buffer *spa_buf;
-    
+
     buf = pw_stream_dequeue_buffer(ctx->stream);
     if (!buf) {
         return;
     }
-    
+
     spa_buf = buf->buffer;
     if (spa_buf->datas[0].data == NULL) {
         pw_stream_queue_buffer(ctx->stream, buf);
         return;
     }
-    
+
     // Copy frame data
     ctx->frame_data = spa_buf->datas[0].data;
     ctx->frame_size = spa_buf->datas[0].chunk->size;
     ctx->frame_available = true;
-    
+
     pw_stream_queue_buffer(ctx->stream, buf);
 }
 
@@ -832,7 +864,7 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old,
                                      enum pw_stream_state state, const char *error) {
     (void)old;
     PipeWireContext *ctx = data;
-    
+
     if (state == PW_STREAM_STATE_ERROR) {
         fprintf(stderr, "[ERROR] PipeWire stream error: %s\n", error);
     } else if (state == PW_STREAM_STATE_STREAMING) {
@@ -849,13 +881,13 @@ static const struct pw_stream_events stream_events = {
 
 static int pipewire_init(PipeWireContext *ctx, int fd, uint32_t node_id) {
     pw_init(NULL, NULL);
-    
+
     ctx->loop = pw_thread_loop_new("recool-loop", NULL);
     if (!ctx->loop) {
         fprintf(stderr, "[ERROR] Failed to create PipeWire loop\n");
         return -1;
     }
-    
+
     ctx->context = pw_context_new(
         pw_thread_loop_get_loop(ctx->loop),
         NULL, 0
@@ -864,21 +896,21 @@ static int pipewire_init(PipeWireContext *ctx, int fd, uint32_t node_id) {
         fprintf(stderr, "[ERROR] Failed to create PipeWire context\n");
         return -1;
     }
-    
+
     if (pw_thread_loop_start(ctx->loop) < 0) {
         fprintf(stderr, "[ERROR] Failed to start PipeWire loop\n");
         return -1;
     }
-    
+
     pw_thread_loop_lock(ctx->loop);
-    
+
     struct pw_core *core = pw_context_connect_fd(ctx->context, fd, NULL, 0);
     if (!core) {
         pw_thread_loop_unlock(ctx->loop);
         fprintf(stderr, "[ERROR] Failed to connect to PipeWire\n");
         return -1;
     }
-    
+
     ctx->stream = pw_stream_new_simple(
         pw_thread_loop_get_loop(ctx->loop),
         "recool-stream",
@@ -891,18 +923,18 @@ static int pipewire_init(PipeWireContext *ctx, int fd, uint32_t node_id) {
         &stream_events,
         ctx
     );
-    
+
     if (!ctx->stream) {
         pw_thread_loop_unlock(ctx->loop);
         fprintf(stderr, "[ERROR] Failed to create PipeWire stream\n");
         return -1;
     }
-    
+
     // Connect to PipeWire node
     uint8_t buffer[1024];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     const struct spa_pod *params[1];
-    
+
     params[0] = spa_pod_builder_add_object(&b,
         SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
         SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
@@ -913,9 +945,9 @@ static int pipewire_init(PipeWireContext *ctx, int fd, uint32_t node_id) {
             SPA_VIDEO_FORMAT_BGRA,
             SPA_VIDEO_FORMAT_RGBA)
     );
-    
+
     fprintf(stderr, "[INFO] Connecting to PipeWire node %u...\n", node_id);
-    
+
     if (pw_stream_connect(ctx->stream,
                          PW_DIRECTION_INPUT,
                          node_id,
@@ -926,9 +958,9 @@ static int pipewire_init(PipeWireContext *ctx, int fd, uint32_t node_id) {
         fprintf(stderr, "[ERROR] Failed to connect PipeWire stream\n");
         return -1;
     }
-    
+
     pw_thread_loop_unlock(ctx->loop);
-    
+
     return 0;
 }
 
@@ -936,7 +968,7 @@ static void* pipewire_get_frame(PipeWireContext *ctx) {
     if (!ctx->frame_available) {
         return NULL;
     }
-    
+
     ctx->frame_available = false;
     return ctx->frame_data;
 }
@@ -945,24 +977,24 @@ static void pipewire_cleanup(PipeWireContext *ctx) {
     if (ctx->loop) {
         pw_thread_loop_lock(ctx->loop);
     }
-    
+
     if (ctx->stream) {
         pw_stream_destroy(ctx->stream);
         ctx->stream = NULL;
     }
-    
+
     if (ctx->loop) {
         pw_thread_loop_unlock(ctx->loop);
         pw_thread_loop_stop(ctx->loop);
         pw_thread_loop_destroy(ctx->loop);
         ctx->loop = NULL;
     }
-    
+
     if (ctx->context) {
         pw_context_destroy(ctx->context);
         ctx->context = NULL;
     }
-    
+
     pw_deinit();
 }
 
@@ -975,48 +1007,48 @@ static int scaler_init(ScalerContext *ctx, int src_width, int src_height, enum A
     ctx->src_height = src_height;
     ctx->dst_width = (int)(src_width * SCALE_FACTOR);
     ctx->dst_height = (int)(src_height * SCALE_FACTOR);
-    
+
     fprintf(stderr, "[INFO] Encoded resolution: %dx%d\n", ctx->dst_width, ctx->dst_height);
-    
+
     ctx->sws_ctx = sws_getContext(
         src_width, src_height, AV_PIX_FMT_BGRA,
         ctx->dst_width, ctx->dst_height, dst_format,
         SCALE_ALGORITHM, NULL, NULL, NULL
     );
-    
+
     if (!ctx->sws_ctx) {
         fprintf(stderr, "[ERROR] Failed to create scaler context\n");
         return -1;
     }
-    
+
     ctx->scaled_frame = av_frame_alloc();
     if (!ctx->scaled_frame) {
         fprintf(stderr, "[ERROR] Failed to allocate scaled frame\n");
         return -1;
     }
-    
+
     ctx->scaled_frame->format = dst_format;
     ctx->scaled_frame->width = ctx->dst_width;
     ctx->scaled_frame->height = ctx->dst_height;
-    
+
     if (av_frame_get_buffer(ctx->scaled_frame, 32) < 0) {
         fprintf(stderr, "[ERROR] Failed to allocate scaled frame buffer\n");
         return -1;
     }
-    
+
     return 0;
 }
 
 static AVFrame* scaler_process(ScalerContext *ctx, void *src_data) {
     const uint8_t *src_slices[1] = { src_data };
     int src_strides[1] = { ctx->src_width * 4 };
-    
+
     sws_scale(ctx->sws_ctx,
               src_slices, src_strides,
               0, ctx->src_height,
               ctx->scaled_frame->data,
               ctx->scaled_frame->linesize);
-    
+
     return ctx->scaled_frame;
 }
 
@@ -1039,47 +1071,47 @@ static const AVCodec* encoder_probe(AVBufferRef **hw_device_ctx) {
     char *priority_copy = strdup(ENCODER_PRIORITY);
     const char *encoders[16];
     int encoder_count = 0;
-    
+
     char *token = strtok(priority_copy, ",");
     while (token && encoder_count < 15) {
         encoders[encoder_count++] = token;
         token = strtok(NULL, ",");
     }
     encoders[encoder_count] = NULL;
-    
+
     for (int i = 0; encoders[i]; i++) {
         const AVCodec *codec = avcodec_find_encoder_by_name(encoders[i]);
         if (!codec) continue;
-        
+
         // Try to initialize hardware device
         AVBufferRef *hw_ctx = NULL;
         enum AVHWDeviceType hw_type = AV_HWDEVICE_TYPE_NONE;
-        
+
         if (strstr(encoders[i], "vaapi")) {
             hw_type = AV_HWDEVICE_TYPE_VAAPI;
         } else if (strstr(encoders[i], "vulkan")) {
             hw_type = AV_HWDEVICE_TYPE_VULKAN;
         }
-        
+
         if (hw_type != AV_HWDEVICE_TYPE_NONE) {
             if (av_hwdevice_ctx_create(&hw_ctx, hw_type, VAAPI_DEVICE, NULL, 0) < 0) {
                 continue;
             }
         }
-        
+
         fprintf(stderr, "[INFO] Hardware encoder: %s\n", encoders[i]);
         *hw_device_ctx = hw_ctx;
         free(priority_copy);
         return codec;
     }
-    
+
     free(priority_copy);
     return NULL;
 }
 
 static int encoder_init(EncoderContext *ctx, int width, int height, const char *output_path) {
     ctx->output_path = strdup(output_path);
-    
+
     ctx->codec = encoder_probe(&ctx->hw_device_ctx);
     if (!ctx->codec) {
         if (REQUIRE_HARDWARE_ACCEL) {
@@ -1087,19 +1119,19 @@ static int encoder_init(EncoderContext *ctx, int width, int height, const char *
             return -1;
         }
     }
-    
+
     ctx->codec_ctx = avcodec_alloc_context3(ctx->codec);
     if (!ctx->codec_ctx) {
         fprintf(stderr, "[ERROR] Failed to allocate codec context\n");
         return -1;
     }
-    
+
     ctx->codec_ctx->width = width;
     ctx->codec_ctx->height = height;
     ctx->codec_ctx->time_base = (AVRational){1, 1};
     ctx->codec_ctx->framerate = (AVRational){1, 1};
     ctx->codec_ctx->gop_size = KEYFRAME_INTERVAL;
-    
+
     // Set pixel format and hardware context
     if (ctx->hw_device_ctx) {
         // Create hardware frames context for uploading sw frames
@@ -1108,31 +1140,31 @@ static int encoder_init(EncoderContext *ctx, int width, int height, const char *
             fprintf(stderr, "[ERROR] Failed to create hardware frames context\n");
             return -1;
         }
-        
+
         AVHWFramesContext *frames_ctx = (AVHWFramesContext*)hw_frames_ref->data;
         frames_ctx->format = AV_PIX_FMT_VAAPI;
         frames_ctx->sw_format = AV_PIX_FMT_NV12;
         frames_ctx->width = width;
         frames_ctx->height = height;
         frames_ctx->initial_pool_size = 20;
-        
+
         if (av_hwframe_ctx_init(hw_frames_ref) < 0) {
             fprintf(stderr, "[ERROR] Failed to initialize hardware frames context\n");
             av_buffer_unref(&hw_frames_ref);
             return -1;
         }
-        
+
         ctx->hw_frames_ctx = hw_frames_ref;
         ctx->codec_ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ref);
         ctx->codec_ctx->pix_fmt = AV_PIX_FMT_VAAPI;
-        
+
         // Allocate hardware frame for uploads
         ctx->hw_frame = av_frame_alloc();
         if (!ctx->hw_frame) {
             fprintf(stderr, "[ERROR] Failed to allocate hardware frame\n");
             return -1;
         }
-        
+
         if (av_hwframe_get_buffer(hw_frames_ref, ctx->hw_frame, 0) < 0) {
             fprintf(stderr, "[ERROR] Failed to allocate hardware frame buffer\n");
             return -1;
@@ -1140,136 +1172,136 @@ static int encoder_init(EncoderContext *ctx, int width, int height, const char *
     } else {
         ctx->codec_ctx->pix_fmt = AV_PIX_FMT_YUV420P;
     }
-    
+
     av_opt_set(ctx->codec_ctx->priv_data, "preset", VIDEO_PRESET, 0);
-    
+
     // CRF not supported by VAAPI, use global_quality instead
     if (ctx->hw_device_ctx && strstr(ctx->codec->name, "vaapi")) {
         ctx->codec_ctx->global_quality = VIDEO_CRF;
     } else {
         av_opt_set_int(ctx->codec_ctx->priv_data, "crf", VIDEO_CRF, 0);
     }
-    
+
     if (avcodec_open2(ctx->codec_ctx, ctx->codec, NULL) < 0) {
         fprintf(stderr, "[ERROR] Failed to open codec\n");
         return -1;
     }
-    
+
     // Create output format context
     if (avformat_alloc_output_context2(&ctx->format_ctx, NULL, NULL, output_path) < 0) {
         fprintf(stderr, "[ERROR] Failed to create output context\n");
         return -1;
     }
-    
+
     ctx->stream = avformat_new_stream(ctx->format_ctx, NULL);
     if (!ctx->stream) {
         fprintf(stderr, "[ERROR] Failed to create output stream\n");
         return -1;
     }
-    
+
     if (avcodec_parameters_from_context(ctx->stream->codecpar, ctx->codec_ctx) < 0) {
         fprintf(stderr, "[ERROR] Failed to copy codec parameters\n");
         return -1;
     }
-    
+
     ctx->stream->time_base = ctx->codec_ctx->time_base;
-    
+
     if (!(ctx->format_ctx->oformat->flags & AVFMT_NOFILE)) {
         if (avio_open(&ctx->format_ctx->pb, output_path, AVIO_FLAG_WRITE) < 0) {
             fprintf(stderr, "[ERROR] Failed to open output file: %s\n", output_path);
             return -1;
         }
     }
-    
+
     if (avformat_write_header(ctx->format_ctx, NULL) < 0) {
         fprintf(stderr, "[ERROR] Failed to write output header\n");
         return -1;
     }
-    
+
     ctx->pts = 0;
-    
+
     fprintf(stderr, "[INFO] Output: %s\n", output_path);
     fprintf(stderr, "[INFO] Recording started. Press Ctrl+C to stop.\n");
-    
+
     return 0;
 }
 
 static int encoder_send_frame(EncoderContext *ctx, AVFrame *frame) {
     AVFrame *encode_frame = frame;
-    
+
     // Upload to hardware frame if using hardware encoding
     if (ctx->hw_frame) {
         if (av_hwframe_transfer_data(ctx->hw_frame, frame, 0) < 0) {
             fprintf(stderr, "[ERROR] Failed to transfer frame to hardware\n");
             return -1;
         }
-        
+
         if (av_frame_copy_props(ctx->hw_frame, frame) < 0) {
             fprintf(stderr, "[ERROR] Failed to copy frame properties\n");
             return -1;
         }
-        
+
         encode_frame = ctx->hw_frame;
     }
-    
+
     encode_frame->pts = ctx->pts++;
-    
+
     if (avcodec_send_frame(ctx->codec_ctx, encode_frame) < 0) {
         fprintf(stderr, "[ERROR] Failed to send frame to encoder\n");
         return -1;
     }
-    
+
     while (1) {
         AVPacket *pkt = av_packet_alloc();
         int ret = avcodec_receive_packet(ctx->codec_ctx, pkt);
-        
+
         if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
             av_packet_free(&pkt);
             break;
         }
-        
+
         if (ret < 0) {
             av_packet_free(&pkt);
             fprintf(stderr, "[ERROR] Failed to receive packet from encoder\n");
             return -1;
         }
-        
+
         pkt->stream_index = ctx->stream->index;
         av_packet_rescale_ts(pkt, ctx->codec_ctx->time_base, ctx->stream->time_base);
-        
+
         if (av_interleaved_write_frame(ctx->format_ctx, pkt) < 0) {
             av_packet_free(&pkt);
             fprintf(stderr, "[ERROR] Failed to write frame\n");
             return -1;
         }
-        
+
         av_packet_free(&pkt);
     }
-    
+
     return 0;
 }
 
 static void encoder_flush(EncoderContext *ctx) {
     avcodec_send_frame(ctx->codec_ctx, NULL);
-    
+
     while (1) {
         AVPacket *pkt = av_packet_alloc();
         int ret = avcodec_receive_packet(ctx->codec_ctx, pkt);
-        
+
         if (ret == AVERROR_EOF || ret == AVERROR(EAGAIN)) {
             av_packet_free(&pkt);
             break;
         }
-        
+
         if (ret >= 0) {
             pkt->stream_index = ctx->stream->index;
             av_packet_rescale_ts(pkt, ctx->codec_ctx->time_base, ctx->stream->time_base);
             av_interleaved_write_frame(ctx->format_ctx, pkt);
         }
-        
+
         av_packet_free(&pkt);
     }
-    
+
     av_write_trailer(ctx->format_ctx);
 }
 
@@ -1281,23 +1313,23 @@ static void encoder_cleanup(EncoderContext *ctx) {
         avformat_free_context(ctx->format_ctx);
         ctx->format_ctx = NULL;
     }
-    
+
     if (ctx->hw_frame) {
         av_frame_free(&ctx->hw_frame);
     }
-    
+
     if (ctx->codec_ctx) {
         avcodec_free_context(&ctx->codec_ctx);
     }
-    
+
     if (ctx->hw_frames_ctx) {
         av_buffer_unref(&ctx->hw_frames_ctx);
     }
-    
+
     if (ctx->hw_device_ctx) {
         av_buffer_unref(&ctx->hw_device_ctx);
     }
-    
+
     if (ctx->output_path) {
         free(ctx->output_path);
         ctx->output_path = NULL;
@@ -1310,47 +1342,48 @@ static void encoder_cleanup(EncoderContext *ctx) {
 
 int main(void) {
     setup_signal_handlers();
-    
+
     if (ENABLE_NICE_PRIORITY) {
         setpriority(PRIO_PROCESS, 0, 10);
     }
-    
+
     // Load restore token
     char *restore_token = restore_token_load();
-    
+
     // Request screencast
     PortalContext portal = {0};
     if (portal_request_screencast(&portal, restore_token) < 0) {
         if (restore_token) free(restore_token);
         return 1;
     }
-    
-    // Save restore token (will be updated by portal)
-    // Note: Full implementation would extract token from portal response
-    if (restore_token) {
-        restore_token_save(restore_token);
-        free(restore_token);
+
+    // Save new restore token if portal returned one
+    if (portal.restore_token) {
+        restore_token_save(portal.restore_token);
+        fprintf(stderr, "[INFO] Saved permission token for future runs\n");
     }
-    
+
+    if (restore_token) free(restore_token);
+
     // Initialize PipeWire
     PipeWireContext pipewire = {0};
     if (pipewire_init(&pipewire, portal.pipewire_fd, portal.pipewire_node) < 0) {
         portal_cleanup(&portal);
         return 1;
     }
-    
+
     // Wait for first frame to get resolution
     fprintf(stderr, "[INFO] Waiting for first frame...\n");
     while (pipewire.width == 0 && g_running) {
         usleep(100000);
     }
-    
+
     if (!g_running || pipewire.width == 0) {
         pipewire_cleanup(&pipewire);
         portal_cleanup(&portal);
         return 1;
     }
-    
+
     // Get output filename
     char *output_path = get_output_filename();
     if (!output_path) {
@@ -1358,11 +1391,11 @@ int main(void) {
         portal_cleanup(&portal);
         return 1;
     }
-    
+
     // Calculate scaled dimensions
     int scaled_width = (int)(pipewire.width * SCALE_FACTOR);
     int scaled_height = (int)(pipewire.height * SCALE_FACTOR);
-    
+
     // Initialize encoder first to determine pixel format
     EncoderContext encoder = {0};
     if (encoder_init(&encoder, scaled_width, scaled_height, output_path) < 0) {
@@ -1372,7 +1405,7 @@ int main(void) {
         return 1;
     }
     free(output_path);
-    
+
     // Initialize scaler with format needed by encoder
     enum AVPixelFormat scaler_format = encoder.hw_device_ctx ? AV_PIX_FMT_NV12 : AV_PIX_FMT_YUV420P;
     ScalerContext scaler = {0};
@@ -1382,7 +1415,7 @@ int main(void) {
         portal_cleanup(&portal);
         return 1;
     }
-    
+
     // Create timer
     int timerfd = timerfd_create(CLOCK_MONOTONIC, 0);
     struct itimerspec timer_spec = {
@@ -1390,57 +1423,57 @@ int main(void) {
         .it_value = {1, 0}
     };
     timerfd_settime(timerfd, 0, &timer_spec, NULL);
-    
+
     g_start_time = time(NULL);
-    
+
     // Main loop
     while (g_running) {
         struct pollfd pfd = {.fd = timerfd, .events = POLLIN};
         if (poll(&pfd, 1, 1000) <= 0) continue;
-        
+
         uint64_t expirations;
         read(timerfd, &expirations, sizeof(expirations));
-        
+
         void *frame_data = pipewire_get_frame(&pipewire);
         if (!frame_data) {
             usleep(10000);
             continue;
         }
-        
+
         AVFrame *scaled_frame = scaler_process(&scaler, frame_data);
         if (encoder_send_frame(&encoder, scaled_frame) == 0) {
             g_frame_count++;
         }
     }
-    
+
     // Cleanup
     close(timerfd);
-    
+
     fprintf(stderr, "\n[INFO] Shutting down gracefully...\n");
     fprintf(stderr, "[INFO] Flushing encoder...\n");
-    
+
     encoder_flush(&encoder);
-    
+
     time_t duration = time(NULL) - g_start_time;
     int hours = duration / 3600;
     int minutes = (duration % 3600) / 60;
     int seconds = duration % 60;
-    
+
     struct stat st;
     long file_size = 0;
     if (stat(encoder.output_path, &st) == 0) {
         file_size = st.st_size / (1024 * 1024);
     }
-    
+
     fprintf(stderr, "[INFO] Video saved: %s\n", encoder.output_path);
     fprintf(stderr, "[INFO] Duration: %dh %dm %ds (%lu frames)\n",
             hours, minutes, seconds, g_frame_count);
     fprintf(stderr, "[INFO] File size: %ld MB\n", file_size);
-    
+
     encoder_cleanup(&encoder);
     scaler_cleanup(&scaler);
     pipewire_cleanup(&pipewire);
     portal_cleanup(&portal);
-    
+
     return 0;
 }

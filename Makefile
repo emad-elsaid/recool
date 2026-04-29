@@ -52,16 +52,22 @@ check-deps:
 	done
 	@which $(CC) > /dev/null && echo "  ✓ $(CC)" || echo "  ✗ $(CC) (MISSING)"
 
+# Run target - build and execute
+run: $(TARGET)
+	@echo "Starting $(TARGET)..."
+	./$(TARGET)
+
 # Help target
 help:
 	@echo "Recool - Wayland Screen Recorder"
 	@echo ""
 	@echo "Targets:"
 	@echo "  make          - Build recool binary"
+	@echo "  make run      - Build and run recool"
 	@echo "  make clean    - Remove build artifacts"
 	@echo "  make install  - Install to ~/.local/bin"
 	@echo "  make uninstall- Remove from ~/.local/bin"
 	@echo "  make check-deps- Verify all dependencies present"
 	@echo "  make help     - Show this help message"
 
-.PHONY: all clean install uninstall check-deps help
+.PHONY: all clean install uninstall check-deps help run
