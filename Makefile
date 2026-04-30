@@ -8,7 +8,7 @@ CFLAGS := -O3 -march=native -flto \
           -std=c11 -D_POSIX_C_SOURCE=200809L
 
 # Package dependencies
-PACKAGES := libpipewire-0.3 dbus-1 libavformat libavcodec libavutil libswscale
+PACKAGES := libpipewire-0.3 dbus-1 libavformat libavcodec libavutil libswscale sqlite3
 
 # Compilation flags from pkg-config
 PKG_CFLAGS := $(shell pkg-config --cflags $(PACKAGES))

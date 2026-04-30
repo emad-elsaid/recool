@@ -9,12 +9,13 @@ Wayland screen recorder designed for 24/7 low-resource capture. Single-file C im
 - **24/7 operation**: Optimized for continuous long-running capture
 - **Zero configuration**: Sensible defaults, runs out of the box
 - **Single binary**: No external config files or dependencies at runtime
+- **SQLite database**: Metadata tracking and indexing (in development)
 
 ## Quick Start
 
 ```bash
 # Install dependencies (Arch Linux)
-sudo pacman -S pipewire dbus ffmpeg clang
+sudo pacman -S pipewire dbus ffmpeg sqlite clang
 
 # Build and run
 make
@@ -24,6 +25,8 @@ make
 Grant screen capture permission in the system dialog, then press Ctrl+C to stop recording.
 
 Videos are saved to `~/Videos/Recools/YYYY-MM-DD-HH-MM-SS.mp4`
+
+Database stored at `~/.local/share/recool/recool.db`
 
 ## Installation
 
@@ -48,6 +51,7 @@ make install
 - libpipewire-0.3
 - dbus-1
 - FFmpeg (libavformat, libavcodec, libavutil, libswscale)
+- sqlite3
 
 **Optional (for hardware encoding):**
 - VA-API drivers (intel-media-driver, libva-mesa-driver, etc.)
@@ -55,7 +59,7 @@ make install
 
 ## Configuration
 
-Edit constants at the top of `recool.c` (lines 10-39):
+Edit constants at the top of `recool.c` (lines 10-42):
 
 ```c
 // Capture settings
@@ -65,6 +69,10 @@ Edit constants at the top of `recool.c` (lines 10-39):
 // Output settings
 #define OUTPUT_BASE_DIR             "Videos/Recools"
 #define OUTPUT_FILENAME_FORMAT      "%Y-%m-%d-%H-%M-%S"
+
+// Database settings
+#define DATABASE_DIR                ".local/share/recool"
+#define DATABASE_FILENAME           "recool.db"
 
 // Encoder settings
 #define ENCODER_PRIORITY            "hevc_vaapi,h264_vaapi,libx265,libx264"
@@ -82,6 +90,7 @@ Rebuild after changes: `make clean && make`
 3. libswscale → software downscaling
 4. FFmpeg encoder → hardware-accelerated encoding (VAAPI/Vulkan) or software fallback
 5. MP4 muxer → output file
+6. SQLite database → metadata tracking (in development)
 
 **Encoder priority:**
 1. HEVC VAAPI (best compression, requires hardware)
@@ -122,7 +131,7 @@ Typical resource usage (1920x1080 @ 50% scale, 1 FPS, VAAPI encoding):
 make check-deps
 
 # Install missing packages (Arch)
-sudo pacman -S pipewire dbus ffmpeg clang
+sudo pacman -S pipewire dbus ffmpeg sqlite clang
 ```
 
 **Permission dialog doesn't appear:**
@@ -143,10 +152,11 @@ sudo pacman -S pipewire dbus ffmpeg clang
 
 - **Language**: C11 with POSIX extensions
 - **Build system**: Make
-- **Lines of code**: ~1450 (single file)
+- **Lines of code**: ~1560 (single file)
 - **Wayland protocols**: XDG Desktop Portal ScreenCast
 - **Video format**: MP4 container, HEVC/H.264 codec
 - **Color space**: BGRx/BGRA input → NV12/YUV420P encoding
+- **Database**: SQLite 3.35+ for metadata and indexing
 
 ## License
 
@@ -156,9 +166,10 @@ See source file header for license information.
 
 This is a minimal single-file implementation. When contributing:
 - Keep all code in `recool.c` (no separate headers)
-- Maintain subsystem prefixes (`portal_*`, `pipewire_*`, `encoder_*`, `scaler_*`)
+- Maintain subsystem prefixes (`portal_*`, `pipewire_*`, `encoder_*`, `scaler_*`, `database_*`)
 - Use `[INFO]`, `[WARNING]`, `[ERROR]` log prefixes
 - Test with both hardware and software encoding paths
+- Follow incremental development strategy (see AGENTS.md)
 
 ## See Also
 

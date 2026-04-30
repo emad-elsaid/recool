@@ -16,6 +16,10 @@
 #define OUTPUT_FILENAME_FORMAT      "%Y-%m-%d-%H-%M-%S"        // YYYY-MM-DD-HH-MM-SS
 #define OUTPUT_FILE_EXTENSION       ".mp4"
 
+// Database settings
+#define DATABASE_DIR                ".local/share/recool"      // Relative to HOME
+#define DATABASE_FILENAME           "recool.db"
+
 // Encoder settings
 #define ENCODER_PRIORITY            "hevc_vaapi,h264_vaapi,libx265,libx264"
 #define VIDEO_CRF                   28          // Quality (0=best, 51=worst)
@@ -77,6 +81,9 @@
 #include <libavutil/hwcontext.h>
 #include <libswscale/swscale.h>
 
+// SQLite
+#include <sqlite3.h>
+
 // ============================================================================
 // GLOBAL STATE
 // ============================================================================
@@ -137,6 +144,11 @@ typedef struct {
     int64_t pts;
     char *output_path;
 } EncoderContext;
+
+typedef struct {
+    sqlite3 *db;
+    char *db_path;
+} DatabaseContext;
 
 // ============================================================================
 // SIGNAL HANDLING
@@ -293,6 +305,61 @@ static bool restore_token_save(const char *token) {
     free(token_path);
 
     return true;
+}
+
+// ============================================================================
+// DATABASE MANAGEMENT
+// ============================================================================
+
+static int database_init(DatabaseContext *ctx) {
+    // Expand database path
+    char *db_dir = expand_home_path(DATABASE_DIR);
+    if (!db_dir) {
+        fprintf(stderr, "[ERROR] Failed to expand database directory path\n");
+        return -1;
+    }
+
+    // Create database directory if it doesn't exist
+    if (!create_directory_recursive(db_dir)) {
+        fprintf(stderr, "[ERROR] Cannot create database directory: %s\n", db_dir);
+        free(db_dir);
+        return -1;
+    }
+
+    // Build full database path
+    size_t len = strlen(db_dir) + strlen(DATABASE_FILENAME) + 2;
+    ctx->db_path = malloc(len);
+    if (!ctx->db_path) {
+        fprintf(stderr, "[ERROR] Memory allocation failed for database path\n");
+        free(db_dir);
+        return -1;
+    }
+    snprintf(ctx->db_path, len, "%s/%s", db_dir, DATABASE_FILENAME);
+    free(db_dir);
+
+    // Open or create database
+    int rc = sqlite3_open(ctx->db_path, &ctx->db);
+    if (rc != SQLITE_OK) {
+        fprintf(stderr, "[ERROR] Cannot open database: %s\n", sqlite3_errmsg(ctx->db));
+        free(ctx->db_path);
+        ctx->db_path = NULL;
+        return -1;
+    }
+
+    fprintf(stderr, "[INFO] Database: %s\n", ctx->db_path);
+    
+    return 0;
+}
+
+static void database_cleanup(DatabaseContext *ctx) {
+    if (ctx->db) {
+        sqlite3_close(ctx->db);
+        ctx->db = NULL;
+    }
+    if (ctx->db_path) {
+        free(ctx->db_path);
+        ctx->db_path = NULL;
+    }
 }
 
 // ============================================================================
@@ -1347,6 +1414,12 @@ int main(void) {
         setpriority(PRIO_PROCESS, 0, 10);
     }
 
+    // Initialize database
+    DatabaseContext database = {0};
+    if (database_init(&database) < 0) {
+        return 1;
+    }
+
     // Load restore token
     char *restore_token = restore_token_load();
 
@@ -1354,6 +1427,7 @@ int main(void) {
     PortalContext portal = {0};
     if (portal_request_screencast(&portal, restore_token) < 0) {
         if (restore_token) free(restore_token);
+        database_cleanup(&database);
         return 1;
     }
 
@@ -1369,6 +1443,7 @@ int main(void) {
     PipeWireContext pipewire = {0};
     if (pipewire_init(&pipewire, portal.pipewire_fd, portal.pipewire_node) < 0) {
         portal_cleanup(&portal);
+        database_cleanup(&database);
         return 1;
     }
 
@@ -1381,6 +1456,7 @@ int main(void) {
     if (!g_running || pipewire.width == 0) {
         pipewire_cleanup(&pipewire);
         portal_cleanup(&portal);
+        database_cleanup(&database);
         return 1;
     }
 
@@ -1389,6 +1465,7 @@ int main(void) {
     if (!output_path) {
         pipewire_cleanup(&pipewire);
         portal_cleanup(&portal);
+        database_cleanup(&database);
         return 1;
     }
 
@@ -1402,6 +1479,7 @@ int main(void) {
         free(output_path);
         pipewire_cleanup(&pipewire);
         portal_cleanup(&portal);
+        database_cleanup(&database);
         return 1;
     }
     free(output_path);
@@ -1413,6 +1491,7 @@ int main(void) {
         encoder_cleanup(&encoder);
         pipewire_cleanup(&pipewire);
         portal_cleanup(&portal);
+        database_cleanup(&database);
         return 1;
     }
 
@@ -1474,6 +1553,7 @@ int main(void) {
     scaler_cleanup(&scaler);
     pipewire_cleanup(&pipewire);
     portal_cleanup(&portal);
+    database_cleanup(&database);
 
     return 0;
 }
