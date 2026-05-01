@@ -9,7 +9,9 @@
 
 // Capture settings
 #define CAPTURE_INTERVAL_MS         1000        // Screenshot frequency in milliseconds
-#define SCALE_FACTOR                0.5         // 50% of native resolution
+#define SCALE_FACTOR                1.0         // Video resolution scale (0.5-1.0, higher = better OCR but larger files)
+                                                 // For better OCR: use 0.75 or 1.0
+                                                 // For lower storage: use 0.5
 
 // Output settings
 #define OUTPUT_BASE_DIR             "Videos/Recools"           // Relative to HOME
@@ -27,6 +29,14 @@
 #define OCR_BATCH_SIZE              10          // Frames to process before checking stop signal
 #define OCR_LANGUAGE                "eng"       // Tesseract language (eng, fra, deu, etc.)
 
+// OCR accuracy settings
+// PSM (Page Segmentation Mode):
+//   3 = Fully automatic (default, assumes dense paragraphs)
+//   6 = Uniform block of text (good for UI elements)
+//  11 = Sparse text (best for screen captures with scattered text)
+//  13 = Raw line (single line of text)
+#define OCR_PAGE_SEG_MODE           11          // Use 11 for screen captures with sparse UI text
+
 // Perceptual hashing settings
 #define PHASH_ENABLED               1           // Enable duplicate detection
 #define PHASH_THRESHOLD             8           // Hamming distance threshold (0-64, lower = stricter)
@@ -34,6 +44,8 @@
 // Encoder settings
 #define ENCODER_PRIORITY            "hevc_vaapi,h264_vaapi,libx265,libx264"
 #define VIDEO_CRF                   28          // Quality (0=best, 51=worst)
+                                                 // For better OCR: use 20-23 (higher quality, larger files)
+                                                 // For lower storage: use 28-32
 #define VIDEO_PRESET                "ultrafast" // Encoding speed
 #define KEYFRAME_INTERVAL           300         // I-frame every 5 minutes
 
@@ -2161,8 +2173,9 @@ static int ocr_init(OCRContext *ctx, DatabaseContext *db_ctx) {
         return -1;
     }
     
-    // Set Tesseract to single-line mode for better performance
-    TessBaseAPISetPageSegMode(ctx->api, PSM_AUTO);
+    // Configure Tesseract for screen capture OCR
+    // PSM 11 (sparse text) works best for UI elements scattered across the screen
+    TessBaseAPISetPageSegMode(ctx->api, OCR_PAGE_SEG_MODE);
     
     fprintf(stderr, "[INFO] OCR initialized (language: %s)\n", OCR_LANGUAGE);
     
