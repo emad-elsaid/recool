@@ -31,12 +31,14 @@ Required system packages (pkg-config names):
 - dbus-1
 - libavformat, libavcodec, libavutil, libswscale (FFmpeg)
 - sqlite3
+- tesseract (OCR engine)
+- lept (Leptonica image processing)
 
-Also requires `clang` compiler. Use `make check-deps` to verify all are present.
+Also requires `clang` compiler and `pthread` (POSIX threads). Use `make check-deps` to verify all are present.
 
 ## Architecture
 
-**Single-file design**: All code lives in `recool.c` (~1560 lines). No headers, no modules, all inline.
+**Single-file design**: All code lives in `recool.c` (~2400 lines). No headers, no modules, all inline.
 
 **Pipeline:**
 1. D-Bus portal request → user permission dialog
@@ -44,24 +46,34 @@ Also requires `clang` compiler. Use `make check-deps` to verify all are present.
 3. Software scaling (configurable factor, default 0.5x)
 4. Hardware-accelerated encoding (VAAPI preferred) → MP4 output
 5. SQLite database tracking (metadata and indexing)
+6. Background OCR thread → perceptual hashing → text extraction → FTS5 indexing
 
 **Subsystems:**
 - Portal: D-Bus communication for screen capture permission
 - PipeWire: Frame capture from Wayland compositor
 - Scaler: Software frame scaling (libswscale)
 - Encoder: Video encoding (FFmpeg with VAAPI acceleration)
-- Database: SQLite storage for metadata and search index
+- Database: SQLite storage with migrations, metadata tracking, and FTS5 search
+- Perceptual Hash: dHash duplicate detection (reduces OCR workload by >90%)
+- OCR: Background worker thread for text extraction (Tesseract)
 
 **Data Flow:**
 ```
 Wayland → PipeWire → Scaler → Encoder → MP4 file
                         ↓
-                    Database (metadata)
+                    Database (metadata + frames)
+                        ↓
+                    OCR Worker Thread:
+                      1. Extract frame from video
+                      2. Compute perceptual hash (dHash)
+                      3. Check for duplicates
+                      4. Run Tesseract (unique frames only)
+                      5. Store in FTS5 index
 ```
 
 ## Configuration Constants
 
-Top of `recool.c` (lines 10-42) contains all tunable parameters:
+Top of `recool.c` (lines 10-48) contains all tunable parameters:
 
 **Capture settings:**
 - `CAPTURE_INTERVAL_MS`: Screenshot frequency (default 1000ms = 1fps)
@@ -75,6 +87,17 @@ Top of `recool.c` (lines 10-42) contains all tunable parameters:
 **Database settings:**
 - `DATABASE_DIR`: Relative to HOME (default ".local/share/recool")
 - `DATABASE_FILENAME`: Database filename (default "recool.db")
+
+**OCR settings:**
+- `OCR_ENABLED`: Enable background OCR (default 1)
+- `OCR_THREAD_PRIORITY`: Nice priority 0-19 (default 19 = lowest CPU priority)
+- `OCR_PROCESS_DELAY_MS`: Delay between processing frames (default 500ms)
+- `OCR_BATCH_SIZE`: Frames to process before checking stop signal (default 10)
+- `OCR_LANGUAGE`: Tesseract language code (default "eng")
+
+**Perceptual hashing settings:**
+- `PHASH_ENABLED`: Enable duplicate detection (default 1)
+- `PHASH_THRESHOLD`: Hamming distance threshold 0-64 (default 8, lower = stricter)
 
 **Encoder settings:**
 - `ENCODER_PRIORITY`: CSV list (default "hevc_vaapi,h264_vaapi,libx265,libx264")
@@ -101,9 +124,73 @@ Change these constants directly in the source; no runtime flags or config files 
 When modifying C code:
 - Use inline implementations (no separate headers)
 - Configuration changes → edit constants at top of file
-- Structures grouped by subsystem (Portal, PipeWire, Scaler, Encoder, Database)
-- Functions prefixed by subsystem (e.g., `portal_*`, `encoder_*`, `database_*`)
+- Structures grouped by subsystem (Portal, PipeWire, Scaler, Encoder, Database, Perceptual Hash, OCR)
+- Functions prefixed by subsystem (e.g., `portal_*`, `encoder_*`, `database_*`, `ocr_*`)
 - Error messages use `[ERROR]`, info uses `[INFO]`, warnings use `[WARNING]`
+
+## Resource Management Rules
+
+**CRITICAL: Every allocated resource MUST be tracked and cleaned up properly.**
+
+### Mandatory Practices
+
+1. **Store ALL created objects in context structures**
+   - NEVER create objects (malloc, open files, library objects) without storing the handle
+   - If a library function returns a pointer/handle, add it to the relevant context struct
+   - Example: `pw_context_connect_fd()` returns `pw_core*` → MUST be stored in `PipeWireContext.core`
+
+2. **Initialize context structs to zero**
+   - Use `= {0}` or `memset` when declaring context structures
+   - Ensures NULL pointers are safe to check in cleanup functions
+   - Example: `PipeWireContext pipewire = {0};`
+
+3. **Cleanup functions MUST be symmetric with init functions**
+   - For every `*_init()`, write corresponding `*_cleanup()` immediately
+   - Destroy resources in REVERSE order of creation
+   - Always check for NULL before destroying (idempotent cleanup)
+
+4. **Cleanup order matters**
+   - Stop threads/loops FIRST (prevents callbacks on destroyed objects)
+   - Destroy child objects before parent objects
+   - Disconnect before destroy
+   - Example PipeWire cleanup order:
+     1. Stop thread loop
+     2. Destroy stream
+     3. Disconnect core
+     4. Destroy context
+     5. Destroy loop
+     6. Deinitialize library
+
+5. **Test cleanup paths**
+   - Run `make test-cleanup` after any resource management changes
+   - Verify clean exit with Ctrl+C (SIGINT)
+   - Check for segfaults, memory leaks, file descriptor leaks
+   - Use valgrind for thorough validation
+
+### Checklist for New Subsystems
+
+When adding a new subsystem with resource allocation:
+
+```
+[ ] Context structure defined with ALL resource handles
+[ ] Init function creates resources in correct order
+[ ] Cleanup function destroys resources in REVERSE order
+[ ] Cleanup function checks NULL before each destroy
+[ ] Context structure initialized to zero in main()
+[ ] Cleanup function called in main() error paths
+[ ] Cleanup function called in main() normal exit
+[ ] Tested with Ctrl+C (SIGINT)
+[ ] Tested with `make test-cleanup`
+[ ] No segfaults, no memory leaks, no FD leaks
+```
+
+### Common Pitfalls
+
+- **Orphaned objects**: Creating library objects without storing handles → crash on cleanup
+- **Wrong cleanup order**: Destroying parent before children → use-after-free crash
+- **Missing NULL checks**: Calling destroy on uninitialized pointers → segfault
+- **Active callbacks**: Destroying objects while threads still active → race condition crash
+- **Circular dependencies**: Not stopping event loops before destroying objects → deadlock
 
 ## Output
 
@@ -224,9 +311,9 @@ When implementing features:
 
 **Phase 1 (Current Focus):**
 1. ✅ SQLite database integration (basic open/close)
-2. 🔄 Database migrations system (001-003)
-3. Perceptual hashing for duplicate detection
-4. Basic OCR indexing (background only)
+2. ✅ Database migrations system (001-003)
+3. ✅ Basic OCR indexing (background thread with progress tracking)
+4. ✅ Perceptual hashing for duplicate detection (dHash algorithm, >90% OCR reduction)
 5. Simple timeline query interface
 
 **Phase 2:**
@@ -236,6 +323,7 @@ Privacy features (filters, sensitive data detection)
 Usability features (export, keyboard shortcuts)
 
 **Phase 4:**
+Advanced features (multi-monitor, smart homepage)
 Advanced features (multi-monitor, smart homepage)
 
 ### Before Starting ANY Feature

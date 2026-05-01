@@ -20,6 +20,17 @@
 #define DATABASE_DIR                ".local/share/recool"      // Relative to HOME
 #define DATABASE_FILENAME           "recool.db"
 
+// OCR settings
+#define OCR_ENABLED                 1           // Enable background OCR processing
+#define OCR_THREAD_PRIORITY         19          // Nice priority (0-19, higher = lower priority)
+#define OCR_PROCESS_DELAY_MS        500         // Delay between processing frames
+#define OCR_BATCH_SIZE              10          // Frames to process before checking stop signal
+#define OCR_LANGUAGE                "eng"       // Tesseract language (eng, fra, deu, etc.)
+
+// Perceptual hashing settings
+#define PHASH_ENABLED               1           // Enable duplicate detection
+#define PHASH_THRESHOLD             8           // Hamming distance threshold (0-64, lower = stricter)
+
 // Encoder settings
 #define ENCODER_PRIORITY            "hevc_vaapi,h264_vaapi,libx265,libx264"
 #define VIDEO_CRF                   28          // Quality (0=best, 51=worst)
@@ -58,6 +69,7 @@
 #include <signal.h>
 #include <unistd.h>
 #include <time.h>
+#include <ctype.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/timerfd.h>
@@ -83,6 +95,13 @@
 
 // SQLite
 #include <sqlite3.h>
+
+// Tesseract OCR
+#include <tesseract/capi.h>
+#include <leptonica/allheaders.h>
+
+// Threading
+#include <pthread.h>
 
 // ============================================================================
 // GLOBAL STATE
@@ -115,6 +134,7 @@ typedef struct {
     struct pw_thread_loop *loop;
     struct pw_stream *stream;
     struct pw_context *context;
+    struct pw_core *core;
     int width;
     int height;
     enum spa_video_format format;
@@ -148,7 +168,16 @@ typedef struct {
 typedef struct {
     sqlite3 *db;
     char *db_path;
+    int64_t current_recording_id;  // Current recording session ID
 } DatabaseContext;
+
+typedef struct {
+    TessBaseAPI *api;              // Tesseract OCR handle
+    pthread_t thread;              // Background worker thread
+    volatile sig_atomic_t running; // Thread stop signal (atomic for safety)
+    bool thread_created;           // Track if pthread_create succeeded
+    DatabaseContext *db_ctx;       // Reference to database for queries
+} OCRContext;
 
 // ============================================================================
 // SIGNAL HANDLING
@@ -311,6 +340,207 @@ static bool restore_token_save(const char *token) {
 // DATABASE MANAGEMENT
 // ============================================================================
 
+static int database_get_version(DatabaseContext *ctx) {
+    sqlite3_stmt *stmt = NULL;
+    int version = 0;
+    
+    // Check if schema_migrations table exists
+    const char *check_sql = "SELECT name FROM sqlite_master WHERE type='table' AND name='schema_migrations'";
+    if (sqlite3_prepare_v2(ctx->db, check_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    
+    int exists = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    
+    if (!exists) {
+        return 0;
+    }
+    
+    // Get latest version
+    const char *version_sql = "SELECT MAX(version) FROM schema_migrations";
+    if (sqlite3_prepare_v2(ctx->db, version_sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        version = sqlite3_column_int(stmt, 0);
+    }
+    
+    sqlite3_finalize(stmt);
+    return version;
+}
+
+static int database_migration_001(DatabaseContext *ctx) {
+    const char *sql = 
+        "CREATE TABLE IF NOT EXISTS schema_migrations ("
+        "    version INTEGER PRIMARY KEY,"
+        "    applied_at INTEGER NOT NULL"
+        ");"
+        
+        "CREATE TABLE IF NOT EXISTS recordings ("
+        "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    start_time INTEGER NOT NULL,"
+        "    end_time INTEGER,"
+        "    file_path TEXT NOT NULL,"
+        "    resolution TEXT NOT NULL,"
+        "    original_resolution TEXT NOT NULL,"
+        "    duration_seconds INTEGER,"
+        "    file_size_bytes INTEGER,"
+        "    monitor_id INTEGER DEFAULT 0,"
+        "    ocr_completed BOOLEAN DEFAULT 0,"
+        "    created_at INTEGER NOT NULL"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_recordings_time ON recordings(start_time, end_time);"
+        "CREATE INDEX IF NOT EXISTS idx_recordings_ocr ON recordings(ocr_completed);";
+    
+    char *err_msg = NULL;
+    if (sqlite3_exec(ctx->db, sql, NULL, NULL, &err_msg) != SQLITE_OK) {
+        fprintf(stderr, "[ERROR] Migration 001 failed: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        return -1;
+    }
+    
+    return 0;
+}
+
+static int database_migration_002(DatabaseContext *ctx) {
+    const char *sql = 
+        "CREATE TABLE IF NOT EXISTS frames ("
+        "    id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "    recording_id INTEGER NOT NULL,"
+        "    timestamp INTEGER NOT NULL,"
+        "    offset_ms INTEGER NOT NULL,"
+        "    perceptual_hash TEXT,"
+        "    is_duplicate BOOLEAN DEFAULT 0,"
+        "    duplicate_of_frame_id INTEGER,"
+        "    created_at INTEGER NOT NULL,"
+        "    FOREIGN KEY(recording_id) REFERENCES recordings(id) ON DELETE CASCADE"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_frames_recording ON frames(recording_id);"
+        "CREATE INDEX IF NOT EXISTS idx_frames_timestamp ON frames(timestamp);"
+        "CREATE INDEX IF NOT EXISTS idx_frames_hash ON frames(perceptual_hash);";
+    
+    char *err_msg = NULL;
+    if (sqlite3_exec(ctx->db, sql, NULL, NULL, &err_msg) != SQLITE_OK) {
+        fprintf(stderr, "[ERROR] Migration 002 failed: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        return -1;
+    }
+    
+    return 0;
+}
+
+static int database_migration_003(DatabaseContext *ctx) {
+    const char *sql = 
+        "CREATE VIRTUAL TABLE IF NOT EXISTS frame_text USING fts5("
+        "    frame_id UNINDEXED,"
+        "    text_content,"
+        "    content='',"
+        "    tokenize='porter unicode61'"
+        ");"
+        
+        "CREATE TABLE IF NOT EXISTS frame_text_metadata ("
+        "    frame_id INTEGER PRIMARY KEY,"
+        "    ocr_processed_at INTEGER,"
+        "    ocr_language TEXT DEFAULT 'eng',"
+        "    text_confidence REAL,"
+        "    word_count INTEGER,"
+        "    FOREIGN KEY(frame_id) REFERENCES frames(id) ON DELETE CASCADE"
+        ");"
+        "CREATE INDEX IF NOT EXISTS idx_ocr_processed ON frame_text_metadata(ocr_processed_at);";
+    
+    char *err_msg = NULL;
+    if (sqlite3_exec(ctx->db, sql, NULL, NULL, &err_msg) != SQLITE_OK) {
+        fprintf(stderr, "[ERROR] Migration 003 failed: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        return -1;
+    }
+    
+    return 0;
+}
+
+static int database_migration_004(DatabaseContext *ctx) {
+    // Migration 004: Fix FTS5 table to store content
+    // The original migration 003 created a contentless FTS5 table (content='')
+    // which only stores the index but not the actual text. We need to recreate it.
+    
+    const char *sql = 
+        // Drop the old contentless FTS5 table
+        "DROP TABLE IF EXISTS frame_text;"
+        
+        // Recreate with proper content storage
+        "CREATE VIRTUAL TABLE frame_text USING fts5("
+        "    frame_id UNINDEXED,"
+        "    text_content,"
+        "    tokenize='porter unicode61'"
+        ");";
+    
+    char *err_msg = NULL;
+    if (sqlite3_exec(ctx->db, sql, NULL, NULL, &err_msg) != SQLITE_OK) {
+        fprintf(stderr, "[ERROR] Migration 004 failed: %s\n", err_msg);
+        sqlite3_free(err_msg);
+        return -1;
+    }
+    
+    return 0;
+}
+
+static int database_apply_migrations(DatabaseContext *ctx) {
+    typedef struct {
+        int version;
+        const char *description;
+        int (*apply)(DatabaseContext *);
+    } Migration;
+    
+    Migration migrations[] = {
+        {1, "Initial schema (recordings table)", database_migration_001},
+        {2, "Frame metadata and tracking", database_migration_002},
+        {3, "OCR full-text search and progress", database_migration_003},
+        {4, "Fix FTS5 content storage", database_migration_004},
+    };
+    
+    int current_version = database_get_version(ctx);
+    int num_migrations = sizeof(migrations) / sizeof(migrations[0]);
+    
+    for (int i = 0; i < num_migrations; i++) {
+        if (migrations[i].version > current_version) {
+            fprintf(stderr, "[INFO] Applying migration %d: %s\n", 
+                    migrations[i].version, migrations[i].description);
+            
+            char *err_msg = NULL;
+            if (sqlite3_exec(ctx->db, "BEGIN TRANSACTION", NULL, NULL, &err_msg) != SQLITE_OK) {
+                fprintf(stderr, "[ERROR] Failed to begin transaction: %s\n", err_msg);
+                sqlite3_free(err_msg);
+                return -1;
+            }
+            
+            if (migrations[i].apply(ctx) < 0) {
+                sqlite3_exec(ctx->db, "ROLLBACK", NULL, NULL, NULL);
+                return -1;
+            }
+            
+            // Record migration
+            sqlite3_stmt *stmt = NULL;
+            const char *sql = "INSERT INTO schema_migrations (version, applied_at) VALUES (?, ?)";
+            if (sqlite3_prepare_v2(ctx->db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_int(stmt, 1, migrations[i].version);
+                sqlite3_bind_int64(stmt, 2, (int64_t)time(NULL));
+                sqlite3_step(stmt);
+                sqlite3_finalize(stmt);
+            }
+            
+            if (sqlite3_exec(ctx->db, "COMMIT", NULL, NULL, &err_msg) != SQLITE_OK) {
+                fprintf(stderr, "[ERROR] Failed to commit transaction: %s\n", err_msg);
+                sqlite3_free(err_msg);
+                return -1;
+            }
+        }
+    }
+    
+    return 0;
+}
+
 static int database_init(DatabaseContext *ctx) {
     // Expand database path
     char *db_dir = expand_home_path(DATABASE_DIR);
@@ -348,7 +578,94 @@ static int database_init(DatabaseContext *ctx) {
 
     fprintf(stderr, "[INFO] Database: %s\n", ctx->db_path);
     
+    // Enable optimizations
+    char *err_msg = NULL;
+    const char *pragmas = 
+        "PRAGMA journal_mode = WAL;"
+        "PRAGMA synchronous = NORMAL;"
+        "PRAGMA cache_size = -64000;"
+        "PRAGMA temp_store = MEMORY;"
+        "PRAGMA foreign_keys = ON;";
+    
+    if (sqlite3_exec(ctx->db, pragmas, NULL, NULL, &err_msg) != SQLITE_OK) {
+        fprintf(stderr, "[WARNING] Failed to set PRAGMA settings: %s\n", err_msg);
+        sqlite3_free(err_msg);
+    }
+    
+    // Apply migrations
+    if (database_apply_migrations(ctx) < 0) {
+        fprintf(stderr, "[ERROR] Database migrations failed\n");
+        sqlite3_close(ctx->db);
+        free(ctx->db_path);
+        return -1;
+    }
+    
+    ctx->current_recording_id = 0;
+    
     return 0;
+}
+
+static int64_t database_start_recording(DatabaseContext *ctx, const char *file_path, 
+                                         int orig_width, int orig_height,
+                                         int scaled_width, int scaled_height) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = 
+        "INSERT INTO recordings "
+        "(start_time, file_path, resolution, original_resolution, monitor_id, created_at) "
+        "VALUES (?, ?, ?, ?, 0, ?)";
+    
+    if (sqlite3_prepare_v2(ctx->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[ERROR] Failed to prepare recording insert: %s\n", 
+                sqlite3_errmsg(ctx->db));
+        return -1;
+    }
+    
+    time_t now = time(NULL);
+    char resolution[64];
+    char orig_resolution[64];
+    snprintf(resolution, sizeof(resolution), "%dx%d", scaled_width, scaled_height);
+    snprintf(orig_resolution, sizeof(orig_resolution), "%dx%d", orig_width, orig_height);
+    
+    sqlite3_bind_int64(stmt, 1, (int64_t)now);
+    sqlite3_bind_text(stmt, 2, file_path, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, resolution, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, orig_resolution, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 5, (int64_t)now);
+    
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    
+    if (rc != SQLITE_DONE) {
+        fprintf(stderr, "[ERROR] Failed to insert recording: %s\n", sqlite3_errmsg(ctx->db));
+        return -1;
+    }
+    
+    ctx->current_recording_id = sqlite3_last_insert_rowid(ctx->db);
+    fprintf(stderr, "[INFO] Recording session started (ID: %ld)\n", 
+            (long)ctx->current_recording_id);
+    
+    return ctx->current_recording_id;
+}
+
+static void database_end_recording(DatabaseContext *ctx, int64_t duration_sec, int64_t file_size) {
+    if (ctx->current_recording_id == 0) return;
+    
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = 
+        "UPDATE recordings SET end_time = ?, duration_seconds = ?, file_size_bytes = ? "
+        "WHERE id = ?";
+    
+    if (sqlite3_prepare_v2(ctx->db, sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, (int64_t)time(NULL));
+        sqlite3_bind_int64(stmt, 2, duration_sec);
+        sqlite3_bind_int64(stmt, 3, file_size);
+        sqlite3_bind_int64(stmt, 4, ctx->current_recording_id);
+        sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+    }
+    
+    fprintf(stderr, "[INFO] Recording session ended (ID: %ld)\n", 
+            (long)ctx->current_recording_id);
 }
 
 static void database_cleanup(DatabaseContext *ctx) {
@@ -930,7 +1247,7 @@ static void on_stream_process(void *data) {
 static void on_stream_state_changed(void *data, enum pw_stream_state old,
                                      enum pw_stream_state state, const char *error) {
     (void)old;
-    PipeWireContext *ctx = data;
+    (void)data;
 
     if (state == PW_STREAM_STATE_ERROR) {
         fprintf(stderr, "[ERROR] PipeWire stream error: %s\n", error);
@@ -971,8 +1288,8 @@ static int pipewire_init(PipeWireContext *ctx, int fd, uint32_t node_id) {
 
     pw_thread_loop_lock(ctx->loop);
 
-    struct pw_core *core = pw_context_connect_fd(ctx->context, fd, NULL, 0);
-    if (!core) {
+    ctx->core = pw_context_connect_fd(ctx->context, fd, NULL, 0);
+    if (!ctx->core) {
         pw_thread_loop_unlock(ctx->loop);
         fprintf(stderr, "[ERROR] Failed to connect to PipeWire\n");
         return -1;
@@ -1040,26 +1357,46 @@ static void* pipewire_get_frame(PipeWireContext *ctx) {
     return ctx->frame_data;
 }
 
+// CLEANUP PATTERN: Reference implementation for proper resource management
+// This function demonstrates the correct cleanup sequence to prevent crashes:
+//   1. Stop threads/event loops FIRST (prevents callbacks on destroyed objects)
+//   2. Destroy child objects before parents (reverse order of creation)
+//   3. Disconnect before destroy (for network/connection objects)
+//   4. Always NULL-check before destroying (idempotent cleanup)
+//   5. Set pointers to NULL after destruction (prevents double-free)
+//
+// Creation order (pipewire_init):
+//   loop → context → core → stream
+// Destruction order (REVERSE):
+//   stream → core → context → loop
+//
+// CRITICAL: ALL library objects MUST be stored in the context structure.
+// Never create orphaned objects - they WILL cause segfaults during cleanup.
 static void pipewire_cleanup(PipeWireContext *ctx) {
+    // Stop the thread loop first to prevent any callbacks
     if (ctx->loop) {
-        pw_thread_loop_lock(ctx->loop);
+        pw_thread_loop_stop(ctx->loop);
     }
 
+    // Now safely destroy objects in reverse order of creation
     if (ctx->stream) {
         pw_stream_destroy(ctx->stream);
         ctx->stream = NULL;
     }
 
-    if (ctx->loop) {
-        pw_thread_loop_unlock(ctx->loop);
-        pw_thread_loop_stop(ctx->loop);
-        pw_thread_loop_destroy(ctx->loop);
-        ctx->loop = NULL;
+    if (ctx->core) {
+        pw_core_disconnect(ctx->core);
+        ctx->core = NULL;
     }
 
     if (ctx->context) {
         pw_context_destroy(ctx->context);
         ctx->context = NULL;
+    }
+
+    if (ctx->loop) {
+        pw_thread_loop_destroy(ctx->loop);
+        ctx->loop = NULL;
     }
 
     pw_deinit();
@@ -1404,11 +1741,499 @@ static void encoder_cleanup(EncoderContext *ctx) {
 }
 
 // ============================================================================
+// PERCEPTUAL HASHING SUBSYSTEM (Duplicate Detection)
+// ============================================================================
+
+// Compute difference hash (dHash) for an image
+// Returns a 64-bit hash where each bit represents a gradient comparison
+static uint64_t compute_dhash(PIX *image) {
+    if (!image) return 0;
+    
+    // Convert to grayscale if needed
+    PIX *gray = NULL;
+    if (pixGetDepth(image) > 8) {
+        gray = pixConvertTo8(image, 0);
+    } else {
+        gray = pixClone(image);
+    }
+    
+    if (!gray) return 0;
+    
+    // Resize to 9x8 (we need 9 columns to compare 8 adjacent pairs)
+    PIX *small = pixScale(gray, 9.0 / pixGetWidth(gray), 8.0 / pixGetHeight(gray));
+    pixDestroy(&gray);
+    
+    if (!small) return 0;
+    
+    // Compute hash by comparing adjacent horizontal pixels
+    uint64_t hash = 0;
+    for (int y = 0; y < 8; y++) {
+        for (int x = 0; x < 8; x++) {
+            uint32_t left_pixel, right_pixel;
+            pixGetPixel(small, x, y, &left_pixel);
+            pixGetPixel(small, x + 1, y, &right_pixel);
+            
+            // Set bit if left pixel is brighter than right
+            if (left_pixel > right_pixel) {
+                hash |= (1ULL << (y * 8 + x));
+            }
+        }
+    }
+    
+    pixDestroy(&small);
+    return hash;
+}
+
+// Convert 64-bit hash to hex string (16 characters + null terminator)
+static void dhash_to_string(uint64_t hash, char *output) {
+    snprintf(output, 17, "%016lx", hash);
+}
+
+// Parse hex string back to 64-bit hash
+static uint64_t dhash_from_string(const char *hash_str) {
+    if (!hash_str) return 0;
+    return strtoull(hash_str, NULL, 16);
+}
+
+// Compute Hamming distance between two hashes (number of differing bits)
+static int hamming_distance(uint64_t hash1, uint64_t hash2) {
+    uint64_t diff = hash1 ^ hash2;
+    int distance = 0;
+    
+    // Count set bits
+    while (diff) {
+        distance += diff & 1;
+        diff >>= 1;
+    }
+    
+    return distance;
+}
+
+// Check if two hashes represent duplicate/similar images
+static int are_hashes_similar(uint64_t hash1, uint64_t hash2, int threshold) {
+    return hamming_distance(hash1, hash2) <= threshold;
+}
+
+// Find duplicate frame in the same recording based on perceptual hash
+// Returns frame_id of duplicate, or 0 if no duplicate found
+static int64_t find_duplicate_frame(DatabaseContext *db_ctx, int64_t recording_id, 
+                                     uint64_t hash, int threshold) {
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = 
+        "SELECT id, perceptual_hash FROM frames "
+        "WHERE recording_id = ? AND perceptual_hash IS NOT NULL "
+        "ORDER BY id DESC LIMIT 10";  // Check last 10 frames only (efficiency)
+    
+    if (sqlite3_prepare_v2(db_ctx->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return 0;
+    }
+    
+    sqlite3_bind_int64(stmt, 1, recording_id);
+    
+    int64_t duplicate_id = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        int64_t frame_id = sqlite3_column_int64(stmt, 0);
+        const char *hash_str = (const char*)sqlite3_column_text(stmt, 1);
+        
+        if (hash_str) {
+            uint64_t stored_hash = dhash_from_string(hash_str);
+            if (are_hashes_similar(hash, stored_hash, threshold)) {
+                duplicate_id = frame_id;
+                break;
+            }
+        }
+    }
+    
+    sqlite3_finalize(stmt);
+    return duplicate_id;
+}
+
+// ============================================================================
+// OCR PROCESSING SUBSYSTEM
+// ============================================================================
+
+static int ocr_process_frame(OCRContext *ctx, int64_t frame_id, const char *video_path, 
+                             int64_t offset_ms, int64_t recording_id) {
+    // Extract frame from video using FFmpeg
+    char temp_image[512];
+    snprintf(temp_image, sizeof(temp_image), "/tmp/recool_ocr_%ld.png", (long)frame_id);
+    
+    // Use FFmpeg to extract frame at specific timestamp
+    // TODO: Consider getting actual PTS from encoder instead of calculated offset
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), 
+             "ffmpeg -ss %.3f -i \"%s\" -frames:v 1 -y \"%s\" 2>/dev/null",
+             offset_ms / 1000.0, video_path, temp_image);
+    
+    if (system(cmd) != 0) {
+        return -1;
+    }
+    
+    // Load image with Leptonica
+    PIX *image = pixRead(temp_image);
+    if (!image) {
+        unlink(temp_image);
+        return -1;
+    }
+    
+    // Compute perceptual hash for duplicate detection
+    uint64_t phash = 0;
+    char phash_str[17] = {0};
+    int64_t duplicate_of_id = 0;
+    int is_duplicate = 0;
+    
+#if PHASH_ENABLED
+    phash = compute_dhash(image);
+    dhash_to_string(phash, phash_str);
+    
+    // Check if this frame is a duplicate
+    duplicate_of_id = find_duplicate_frame(ctx->db_ctx, recording_id, phash, PHASH_THRESHOLD);
+    if (duplicate_of_id > 0) {
+        is_duplicate = 1;
+    }
+#endif
+    
+    // Only perform OCR if this is NOT a duplicate
+    char *text = NULL;
+    int confidence = 0;
+    int word_count = 0;
+    
+    if (!is_duplicate) {
+        // Perform OCR
+        TessBaseAPISetImage2(ctx->api, image);
+        text = TessBaseAPIGetUTF8Text(ctx->api);
+        confidence = TessBaseAPIMeanTextConf(ctx->api);
+        
+        if (!text) {
+            pixDestroy(&image);
+            unlink(temp_image);
+            return -1;
+        }
+        
+        // Count words
+        char *p = text;
+        while (*p) {
+            if (isspace(*p)) {
+                p++;
+            } else {
+                word_count++;
+                while (*p && !isspace(*p)) p++;
+            }
+        }
+    }
+    
+    // Insert the frame record with perceptual hash and duplicate information
+    sqlite3_stmt *stmt = NULL;
+    const char *frame_sql = 
+        "INSERT INTO frames (recording_id, timestamp, offset_ms, perceptual_hash, "
+        "is_duplicate, duplicate_of_frame_id, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)";
+
+    
+    if (sqlite3_prepare_v2(ctx->db_ctx->db, frame_sql, -1, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(stmt, 1, recording_id);
+        sqlite3_bind_int64(stmt, 2, (int64_t)time(NULL));
+        sqlite3_bind_int64(stmt, 3, offset_ms);
+#if PHASH_ENABLED
+        sqlite3_bind_text(stmt, 4, phash_str, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(stmt, 5, is_duplicate);
+        if (duplicate_of_id > 0) {
+            sqlite3_bind_int64(stmt, 6, duplicate_of_id);
+        } else {
+            sqlite3_bind_null(stmt, 6);
+        }
+        sqlite3_bind_int64(stmt, 7, (int64_t)time(NULL));
+#else
+        sqlite3_bind_null(stmt, 4);
+        sqlite3_bind_int(stmt, 5, 0);
+        sqlite3_bind_null(stmt, 6);
+        sqlite3_bind_int64(stmt, 7, (int64_t)time(NULL));
+#endif
+        
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            sqlite3_finalize(stmt);
+            if (text) TessDeleteText(text);
+            pixDestroy(&image);
+            unlink(temp_image);
+            return -1;
+        }
+        
+        sqlite3_finalize(stmt);
+        // Get the auto-generated frame_id
+        frame_id = sqlite3_last_insert_rowid(ctx->db_ctx->db);
+    } else {
+        if (text) TessDeleteText(text);
+        pixDestroy(&image);
+        unlink(temp_image);
+        return -1;
+    }
+    
+    // Only insert OCR data if this is NOT a duplicate
+    if (!is_duplicate && text) {
+        // Insert into FTS5 table
+        const char *fts_sql = "INSERT INTO frame_text (frame_id, text_content) VALUES (?, ?)";
+        if (sqlite3_prepare_v2(ctx->db_ctx->db, fts_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, frame_id);
+            sqlite3_bind_text(stmt, 2, text, -1, SQLITE_TRANSIENT);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+        
+        // Insert metadata
+        const char *meta_sql = 
+            "INSERT INTO frame_text_metadata "
+            "(frame_id, ocr_processed_at, ocr_language, text_confidence, word_count) "
+            "VALUES (?, ?, ?, ?, ?)";
+        
+        if (sqlite3_prepare_v2(ctx->db_ctx->db, meta_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, frame_id);
+            sqlite3_bind_int64(stmt, 2, (int64_t)time(NULL));
+            sqlite3_bind_text(stmt, 3, OCR_LANGUAGE, -1, SQLITE_STATIC);
+            sqlite3_bind_double(stmt, 4, (double)confidence);
+            sqlite3_bind_int(stmt, 5, word_count);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+    }
+    
+    // Cleanup
+    if (text) TessDeleteText(text);
+    pixDestroy(&image);
+    unlink(temp_image);
+    
+    return 0;
+}
+
+static int ocr_probe_video_duration(const char *video_path) {
+    // Use ffprobe to get video duration in seconds
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd),
+             "ffprobe -v error -show_entries format=duration "
+             "-of default=noprint_wrappers=1:nokey=1 \"%s\" 2>/dev/null",
+             video_path);
+    
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return -1;
+    
+    float duration = 0;
+    if (fscanf(fp, "%f", &duration) != 1) {
+        pclose(fp);
+        return -1;
+    }
+    
+    pclose(fp);
+    return (int)(duration * 1000); // Convert to milliseconds
+}
+
+static void* ocr_worker_thread(void *arg) {
+    OCRContext *ctx = (OCRContext*)arg;
+    
+    // Set thread priority to lowest
+    setpriority(PRIO_PROCESS, 0, OCR_THREAD_PRIORITY);
+    
+    fprintf(stderr, "[INFO] OCR worker thread started (priority: %d)\n", OCR_THREAD_PRIORITY);
+    
+    while (ctx->running) {
+        // Query for recordings that need OCR processing
+        sqlite3_stmt *stmt = NULL;
+        const char *sql = 
+            "SELECT id, file_path, start_time "
+            "FROM recordings "
+            "WHERE (ocr_completed = 0 OR ocr_completed IS NULL) "
+            "  AND end_time IS NOT NULL "
+            "ORDER BY start_time ASC "
+            "LIMIT 1";
+        
+        if (sqlite3_prepare_v2(ctx->db_ctx->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+            sleep(5);
+            continue;
+        }
+        
+        if (sqlite3_step(stmt) != SQLITE_ROW) {
+            // No recordings to process
+            sqlite3_finalize(stmt);
+            sleep(5);
+            continue;
+        }
+        
+        int64_t recording_id = sqlite3_column_int64(stmt, 0);
+        const char *video_path = (const char*)sqlite3_column_text(stmt, 1);
+        
+        // Make a copy of video_path since it's only valid during statement lifetime
+        char *video_path_copy = strdup(video_path);
+        sqlite3_finalize(stmt);
+        
+        if (!video_path_copy) {
+            sleep(5);
+            continue;
+        }
+        
+        fprintf(stderr, "[INFO] OCR processing recording ID %ld: %s\n", 
+                (long)recording_id, video_path_copy);
+        
+        // Probe video to get duration
+        int duration_ms = ocr_probe_video_duration(video_path_copy);
+        if (duration_ms < 0) {
+            fprintf(stderr, "[WARNING] Failed to probe video duration: %s\n", video_path_copy);
+            fprintf(stderr, "[WARNING] Marking recording ID %ld as completed (failed)\n", (long)recording_id);
+            
+            // Mark as completed to avoid infinite retry loop on corrupted files
+            sqlite3_stmt *fail_stmt = NULL;
+            const char *fail_sql = "UPDATE recordings SET ocr_completed = 1 WHERE id = ?";
+            if (sqlite3_prepare_v2(ctx->db_ctx->db, fail_sql, -1, &fail_stmt, NULL) == SQLITE_OK) {
+                sqlite3_bind_int64(fail_stmt, 1, recording_id);
+                sqlite3_step(fail_stmt);
+                sqlite3_finalize(fail_stmt);
+            }
+            
+            free(video_path_copy);
+            sleep(1);  // Brief pause before moving to next recording
+            continue;
+        }
+        
+        // Process frames at CAPTURE_INTERVAL_MS intervals
+        int processed = 0;
+        for (int offset_ms = 0; offset_ms < duration_ms && ctx->running; 
+             offset_ms += CAPTURE_INTERVAL_MS) {
+            
+            // Frame ID will be auto-generated by database
+            if (ocr_process_frame(ctx, 0, video_path_copy, offset_ms, recording_id) == 0) {
+                processed++;
+                
+                // Throttle processing
+                if (processed % OCR_BATCH_SIZE == 0) {
+                    usleep(OCR_PROCESS_DELAY_MS * 1000);
+                }
+            }
+        }
+        
+        // Mark recording as OCR complete
+        stmt = NULL;
+        const char *update_sql = "UPDATE recordings SET ocr_completed = 1 WHERE id = ?";
+        if (sqlite3_prepare_v2(ctx->db_ctx->db, update_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, recording_id);
+            sqlite3_step(stmt);
+            sqlite3_finalize(stmt);
+        }
+        
+        // Get duplicate statistics
+        int unique_count = 0, duplicate_count = 0;
+        const char *stats_sql = 
+            "SELECT "
+            "  SUM(CASE WHEN is_duplicate = 0 THEN 1 ELSE 0 END) as unique_frames, "
+            "  SUM(CASE WHEN is_duplicate = 1 THEN 1 ELSE 0 END) as duplicates "
+            "FROM frames WHERE recording_id = ?";
+        
+        if (sqlite3_prepare_v2(ctx->db_ctx->db, stats_sql, -1, &stmt, NULL) == SQLITE_OK) {
+            sqlite3_bind_int64(stmt, 1, recording_id);
+            if (sqlite3_step(stmt) == SQLITE_ROW) {
+                unique_count = sqlite3_column_int(stmt, 0);
+                duplicate_count = sqlite3_column_int(stmt, 1);
+            }
+            sqlite3_finalize(stmt);
+        }
+        
+        fprintf(stderr, "[INFO] OCR completed recording ID %ld (%d frames: %d unique, %d duplicates, %.1f%% saved)\n", 
+                (long)recording_id, processed, unique_count, duplicate_count, 
+                processed > 0 ? (duplicate_count * 100.0 / processed) : 0.0);
+        
+        free(video_path_copy);
+    }
+    
+    fprintf(stderr, "[INFO] OCR worker thread stopped\n");
+    return NULL;
+}
+
+static int ocr_init(OCRContext *ctx, DatabaseContext *db_ctx) {
+    if (!OCR_ENABLED) {
+        return 0;
+    }
+    
+    ctx->db_ctx = db_ctx;
+    ctx->running = 1;
+    
+    // Initialize Tesseract
+    ctx->api = TessBaseAPICreate();
+    if (TessBaseAPIInit3(ctx->api, NULL, OCR_LANGUAGE) != 0) {
+        fprintf(stderr, "[ERROR] Failed to initialize Tesseract (language: %s)\n", OCR_LANGUAGE);
+        fprintf(stderr, "[ERROR] Install tesseract-data-%s package\n", OCR_LANGUAGE);
+        TessBaseAPIDelete(ctx->api);
+        return -1;
+    }
+    
+    // Set Tesseract to single-line mode for better performance
+    TessBaseAPISetPageSegMode(ctx->api, PSM_AUTO);
+    
+    fprintf(stderr, "[INFO] OCR initialized (language: %s)\n", OCR_LANGUAGE);
+    
+    // Start background worker thread
+    if (pthread_create(&ctx->thread, NULL, ocr_worker_thread, ctx) != 0) {
+        fprintf(stderr, "[ERROR] Failed to create OCR worker thread\n");
+        TessBaseAPIEnd(ctx->api);
+        TessBaseAPIDelete(ctx->api);
+        ctx->api = NULL;
+        return -1;
+    }
+    
+    ctx->thread_created = true;
+    return 0;
+}
+
+static void ocr_cleanup(OCRContext *ctx) {
+    if (!OCR_ENABLED || !ctx->api) {
+        return;
+    }
+    
+    // Stop worker thread
+    ctx->running = 0;
+    
+    // Only join if thread was actually created
+    if (ctx->thread_created) {
+        pthread_join(ctx->thread, NULL);
+    }
+    
+    // Cleanup Tesseract
+    TessBaseAPIEnd(ctx->api);
+    TessBaseAPIDelete(ctx->api);
+}
+
+// ============================================================================
 // MAIN
 // ============================================================================
 
-int main(void) {
+int main(int argc, char **argv) {
     setup_signal_handlers();
+
+    // Parse command-line arguments
+    bool reprocess_mode = false;
+    char *reprocess_path = NULL;
+    
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--reprocess") == 0) {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "[ERROR] --reprocess requires a file path\n");
+                fprintf(stderr, "Usage: %s [--reprocess <video_file.mp4>]\n", argv[0]);
+                return 1;
+            }
+            reprocess_mode = true;
+            reprocess_path = argv[i + 1];
+            i++; // Skip next arg
+        } else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printf("Recool - Wayland Screen Recorder with OCR\n\n");
+            printf("Usage: %s [OPTIONS]\n\n", argv[0]);
+            printf("Options:\n");
+            printf("  --reprocess <file>   Reprocess video file for OCR indexing\n");
+            printf("  --help, -h           Show this help message\n\n");
+            printf("Examples:\n");
+            printf("  %s                                  # Start recording\n", argv[0]);
+            printf("  %s --reprocess ~/Videos/Recools/2026-05-01.mp4\n", argv[0]);
+            return 0;
+        } else {
+            fprintf(stderr, "[ERROR] Unknown option: %s\n", argv[i]);
+            fprintf(stderr, "Use --help for usage information\n");
+            return 1;
+        }
+    }
 
     if (ENABLE_NICE_PRIORITY) {
         setpriority(PRIO_PROCESS, 0, 10);
@@ -1418,6 +2243,40 @@ int main(void) {
     DatabaseContext database = {0};
     if (database_init(&database) < 0) {
         return 1;
+    }
+
+    // Reprocess mode: add recording to database and exit
+    if (reprocess_mode) {
+        if (!OCR_ENABLED) {
+            fprintf(stderr, "[ERROR] OCR is disabled (OCR_ENABLED = 0)\n");
+            database_cleanup(&database);
+            return 1;
+        }
+        
+        // Check if file exists
+        struct stat st;
+        if (stat(reprocess_path, &st) != 0) {
+            fprintf(stderr, "[ERROR] File not found: %s\n", reprocess_path);
+            database_cleanup(&database);
+            return 1;
+        }
+        
+        fprintf(stderr, "[INFO] Reprocessing: %s\n", reprocess_path);
+        
+        // Insert recording into database with ocr_completed = 0
+        // Use dummy resolution values - OCR doesn't need them
+        if (database_start_recording(&database, reprocess_path, 0, 0, 0, 0) < 0) {
+            fprintf(stderr, "[ERROR] Failed to add recording to database\n");
+            database_cleanup(&database);
+            return 1;
+        }
+        
+        // Mark as ended immediately
+        database_end_recording(&database, 0, st.st_size);
+        
+        fprintf(stderr, "[INFO] Added to OCR queue. Run recool normally to process.\n");
+        database_cleanup(&database);
+        return 0;
     }
 
     // Load restore token
@@ -1504,6 +2363,21 @@ int main(void) {
     timerfd_settime(timerfd, 0, &timer_spec, NULL);
 
     g_start_time = time(NULL);
+    
+    // Start recording session in database
+    if (database_start_recording(&database, encoder.output_path, 
+                                  pipewire.width, pipewire.height,
+                                  scaled_width, scaled_height) < 0) {
+        fprintf(stderr, "[WARNING] Failed to record session to database\n");
+    }
+    
+    // Initialize OCR background processor
+    OCRContext ocr = {0};
+    if (OCR_ENABLED) {
+        if (ocr_init(&ocr, &database) < 0) {
+            fprintf(stderr, "[WARNING] OCR initialization failed, continuing without OCR\n");
+        }
+    }
 
     // Main loop
     while (g_running) {
@@ -1529,6 +2403,10 @@ int main(void) {
     close(timerfd);
 
     fprintf(stderr, "\n[INFO] Shutting down gracefully...\n");
+    
+    // Stop OCR worker
+    ocr_cleanup(&ocr);
+    
     fprintf(stderr, "[INFO] Flushing encoder...\n");
 
     encoder_flush(&encoder);
@@ -1543,17 +2421,26 @@ int main(void) {
     if (stat(encoder.output_path, &st) == 0) {
         file_size = st.st_size / (1024 * 1024);
     }
+    
+    // Update recording end time in database
+    database_end_recording(&database, duration, st.st_size);
 
     fprintf(stderr, "[INFO] Video saved: %s\n", encoder.output_path);
     fprintf(stderr, "[INFO] Duration: %dh %dm %ds (%lu frames)\n",
             hours, minutes, seconds, g_frame_count);
     fprintf(stderr, "[INFO] File size: %ld MB\n", file_size);
 
+    fprintf(stderr, "[DEBUG] Cleaning up encoder...\n");
     encoder_cleanup(&encoder);
+    fprintf(stderr, "[DEBUG] Cleaning up scaler...\n");
     scaler_cleanup(&scaler);
+    fprintf(stderr, "[DEBUG] Cleaning up pipewire...\n");
     pipewire_cleanup(&pipewire);
+    fprintf(stderr, "[DEBUG] Cleaning up portal...\n");
     portal_cleanup(&portal);
+    fprintf(stderr, "[DEBUG] Cleaning up database...\n");
     database_cleanup(&database);
+    fprintf(stderr, "[DEBUG] All cleanup complete\n");
 
     return 0;
 }
